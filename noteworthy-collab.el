@@ -360,7 +360,8 @@ If MODE-CHECK (symbol) is provided, it tries to find a window with that major-mo
   "Handle incoming WebSocket message."
   (condition-case err
       (let* ((payload (websocket-frame-text frame))
-             (msg (json-parse-string payload :object-type 'alist)))
+             (msg (json-parse-string payload :object-type 'alist
+                                      :false-object nil :null-object nil)))
         (noteworthy-collab--log 'info "RECV raw: %s" (noteworthy-collab--truncate-for-log payload))
         (noteworthy-collab--handle-message msg))
     (error
@@ -1250,7 +1251,8 @@ always runs."
          (goto-char (point-min))
          (if (re-search-forward "\n\n" nil t)
              (condition-case nil
-                 (let ((json-data (json-parse-buffer :object-type 'alist)))
+                 (let ((json-data (json-parse-buffer :object-type 'alist
+                                                     :false-object nil :null-object nil)))
                    (funcall callback json-data))
                (error (funcall callback nil)))
            (funcall callback nil))))

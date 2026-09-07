@@ -128,7 +128,9 @@
                (buffer-list))))
 
 (defun noteworthy-collab-preview--on-message (_ws frame)
-  (let* ((payload (ignore-errors (json-read-from-string (websocket-frame-text frame))))
+  (let* ((payload (ignore-errors (json-parse-string (websocket-frame-text frame)
+                                           :object-type 'alist
+                                           :false-object nil :null-object nil)))
          (event (alist-get 'event payload)))
     (pcase event
       ("syncEditorChanges" (noteworthy-collab-preview--sync-all))

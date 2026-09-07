@@ -4,9 +4,12 @@
 
 ;;; Code:
 
-(require 'treemacs)
-(require 'pdf-tools)
-(require 'vterm)
+;; Soft requires: a missing terminal or PDF viewer should degrade that one
+;; window, not stop the collab client from loading.  vterm in particular fails
+;; hard when its native module cannot find libvterm.
+(require 'treemacs nil t)
+(require 'pdf-tools nil t)
+(require 'vterm nil t)
 ;; cl-find-if below is not autoloaded.
 (require 'cl-lib)
 
@@ -203,15 +206,23 @@ Optional PDF-PATH-ARG specifies a PDF file to display."
                              (executable-find "bash")
                              (getenv "SHELL"))))
           ;; Configure vterm to run our specific command
-          (let ((cmd (if (listp shell-cmd)
-                         (mapconcat #'identity shell-cmd " ")
-                       shell-cmd))
-                (old-shell (if (boundp 'vterm-shell) vterm-shell nil)))
-            (setq vterm-shell cmd)
-            (unwind-protect
-                (let ((display-buffer-alist nil))
-                  (vterm))
-              (when old-shell (setq vterm-shell old-shell))))))
+          (if (not (fboundp 'vterm))
+              (progn
+                (switch-to-buffer (get-buffer-create "*noteworthy-terminal*"))
+                (let ((inhibit-read-only t))
+                  (erase-buffer)
+                  (insert "\n  vterm is not available in this Emacs.\n"
+                          "  Collaboration works without it; this window is just a placeholder.\n"))
+                (message "Noteworthy: vterm unavailable, skipping terminal window"))
+            (let ((cmd (if (listp shell-cmd)
+                           (mapconcat #'identity shell-cmd " ")
+                         shell-cmd))
+                  (old-shell (if (boundp 'vterm-shell) vterm-shell nil)))
+              (setq vterm-shell cmd)
+              (unwind-protect
+                  (let ((display-buffer-alist nil))
+                    (vterm))
+                (when old-shell (setq vterm-shell old-shell)))))))
 
       (select-window editor-window)
       
