@@ -91,6 +91,42 @@ This will:
 | `noteworthy-collab-send-chat` | Send a chat message |
 | `noteworthy-collab-debug` | Dump connection/session state |
 
+### Preview
+
+The preview is a tinymist session you start yourself on the machine holding the
+project -- deliberately *not* the one behind the GUI server's
+`/api/tinymist/start`, which is a single process shared by every client (push
+one editor's buffer into that and everybody sees your unsaved text).
+
+```bash
+# on the server, from the project root
+tinymist preview --no-open --root . \
+  --data-plane-host 127.0.0.1:23625 --control-plane-host 127.0.0.1:23626 \
+  templates/core/parser.typ
+
+# locally: forward the page (data plane) and the control plane
+ssh -L 23625:localhost:23625 -L 23626:localhost:23626 yourserver
+```
+
+```elisp
+(setq noteworthy-collab-preview-url "http://localhost:23625")          ; xwidget
+(setq noteworthy-collab-preview-control-url "ws://localhost:23626")    ; overlays
+```
+
+Then `M-x noteworthy-collab-preview-connect`. That session sees the project
+both ways at once:
+
+| Source | What it covers |
+| ------ | -------------- |
+| Filesystem | Every file you do not have open, including the CRDT room's debounced writes |
+| Memory overlay | The buffers you do have open, pushed over the control plane |
+
+Edits reach the preview from the buffer, not the disk -- a peer's edit lands in
+your buffer through the CRDT and is pushed straight on, so the overlay is
+always the merged text and simply arrives sooner than the room's write. Closing
+or leaving a file drops its overlay, so tinymist reads that file from disk
+again.
+
 ### Configuration
 
 ```elisp

@@ -25,6 +25,7 @@
 
 (require 'noteworthy-collab-layout)
 (require 'noteworthy-collab-keys)
+(require 'noteworthy-collab-preview)
 
 ;;; ============================================================
 ;;; Customization
@@ -617,16 +618,23 @@ Usually redundant: `typst-preview--send-buffer-on-type' sits on
 `after-change-functions' and now fires on its own for remote edits.  This
 covers the case where a preview session is attached but that buffer-local
 hook is not installed."
-  (when (and buffer-file-name
-             (not (memq #'typst-preview--send-buffer-on-type after-change-functions))
-             (fboundp 'typst-preview-connected-p)
-             (fboundp 'typst-preview--send-buffer)
-             (ignore-errors (typst-preview-connected-p)))
+  (cond
+   ;; A standalone tinymist session we drive ourselves (see
+   ;; noteworthy-collab-preview.el).
+   ((noteworthy-collab-preview-connected-p)
+    (noteworthy-collab-preview-push))
+   ;; Otherwise a local typst-preview.el session, if one is attached but its
+   ;; buffer-local after-change hook is not installed.
+   ((and buffer-file-name
+         (not (memq #'typst-preview--send-buffer-on-type after-change-functions))
+         (fboundp 'typst-preview-connected-p)
+         (fboundp 'typst-preview--send-buffer)
+         (ignore-errors (typst-preview-connected-p)))
     (condition-case err
         (typst-preview--send-buffer)
       (error
        (noteworthy-collab--log 'warn "Preview notify failed: %s"
-                               (error-message-string err))))))
+                               (error-message-string err)))))))
 
 (defun noteworthy-collab--apply-ops (ops)
   "Apply delta OPS to current buffer with bounds checking.
@@ -828,6 +836,9 @@ MSG accepts both legacy and canonical selection fields."
   
   ;; Install hooks
   (add-hook 'after-change-functions #'noteworthy-collab--after-change nil t)
+  ;; Separate from --after-change on purpose: that one skips remote edits to
+  ;; avoid echoing them back, while the preview wants both directions.
+  (add-hook 'after-change-functions #'noteworthy-collab--push-preview-on-change nil t)
   (add-hook 'post-command-hook #'noteworthy-collab--post-command nil t)
   (add-hook 'kill-buffer-hook #'noteworthy-collab--on-kill nil t)
   (noteworthy-collab--log 'info "Hooks installed for: %s (after-change-functions has %d items)" 
@@ -843,10 +854,21 @@ MSG accepts both legacy and canonical selection fields."
     (setq buffer-auto-save-file-name noteworthy-collab--saved-auto-save)
     (noteworthy-collab--log 'info "Restored auto-save for: %s" (buffer-name)))
   
+  ;; Stop shadowing this file: tinymist must fall back to the copy on disk,
+  ;; which the room keeps current.
+  (noteworthy-collab-preview-drop)
+
   ;; Remove hooks
   (remove-hook 'after-change-functions #'noteworthy-collab--after-change t)
+  (remove-hook 'after-change-functions #'noteworthy-collab--push-preview-on-change t)
   (remove-hook 'post-command-hook #'noteworthy-collab--post-command t)
   (remove-hook 'kill-buffer-hook #'noteworthy-collab--on-kill t))
+
+(defun noteworthy-collab--push-preview-on-change (_beg _end _len)
+  "Push this buffer to a standalone tinymist session after any change.
+Local and remote edits alike -- both are the CRDT-merged text."
+  (when (noteworthy-collab-preview-connected-p)
+    (noteworthy-collab-preview-push)))
 
 (defun noteworthy-collab--after-change (beg end len)
   "Hook for after-change-functions. Send delta to server.
