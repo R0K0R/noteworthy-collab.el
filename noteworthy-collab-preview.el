@@ -37,6 +37,9 @@
 
 (require 'websocket)
 (require 'json)
+;; cl-pushnew and seq-filter below are not autoloaded.
+(require 'cl-lib)
+(require 'seq)
 
 (defcustom noteworthy-collab-preview-control-url "ws://localhost:23626"
   "Control-plane WebSocket URL of a standalone tinymist preview session."

@@ -16,6 +16,10 @@
 (require 'websocket)
 (require 'json)
 (require 'url-util)
+;; cl-find-if/cl-count-if (this file) and hash-table-keys (subr-x) are used
+;; below but not autoloaded.
+(require 'cl-lib)
+(require 'subr-x)
 
 ;; Load companion modules
 (require 'noteworthy-typst)
@@ -93,6 +97,24 @@
 (defvar-local noteworthy-collab--active nil
   "Non-nil when this buffer is in collaborative mode.")
 
+(defvar-local noteworthy-collab--synced nil
+  "Non-nil once the authoritative sync for this buffer has been applied.
+Cleared on join/rejoin.  Local edits made before it is set would compute
+retain/delete offsets against content the server doesn't recognize, so
+`noteworthy-collab--after-change' refuses to send until this is non-nil.")
+
+(defvar-local noteworthy-collab--sync-warned nil
+  "Non-nil once we've warned the user about editing before `--synced'.
+Keeps that warning to once per buffer instead of once per keystroke.")
+
+(defconst noteworthy-collab--unset (make-symbol "noteworthy-collab--unset")
+  "Sentinel distinguishing \"no saved value\" from a saved nil.")
+
+(defvar-local noteworthy-collab--saved-read-only noteworthy-collab--unset
+  "This buffer's own `buffer-read-only' from before we forced it read-only
+while disconnected (see `noteworthy-collab--mark-buffers-read-only').  The
+sentinel `noteworthy-collab--unset' means we haven't forced it.")
+
 (defvar noteworthy-collab--remote-cursors (make-hash-table :test 'equal)
   "Hash-table mapping user-id -> (cursor-overlay . selection-overlay).")
 
@@ -114,6 +136,26 @@
 (defvar noteworthy-collab-log-buffer "*noteworthy-collab-log*"
   "Name of the collaboration log buffer.")
 
+(defcustom noteworthy-collab-log-max-lines 4000
+  "Maximum lines to retain in the collab log buffer.
+Older lines are dropped once the buffer grows past this."
+  :type 'integer
+  :group 'noteworthy-collab)
+
+(defconst noteworthy-collab--log-payload-limit 500
+  "Max characters of a raw JSON payload to log before eliding the rest.
+A \"sync\" payload carries a whole document, and delta/cursor traffic can
+fire once per keystroke -- logging either unabridged would grow the log
+buffer without bound.")
+
+(defun noteworthy-collab--truncate-for-log (str)
+  "Truncate STR to `noteworthy-collab--log-payload-limit' characters."
+  (if (and (stringp str) (> (length str) noteworthy-collab--log-payload-limit))
+      (format "%s...[%d more chars]"
+              (substring str 0 noteworthy-collab--log-payload-limit)
+              (- (length str) noteworthy-collab--log-payload-limit))
+    str))
+
 (defun noteworthy-collab--log (level fmt &rest args)
   "Log message to the collab log buffer.
 LEVEL is a symbol like `info', `warn', `error'.
@@ -124,16 +166,24 @@ FMT and ARGS are passed to `format'."
     (with-current-buffer (get-buffer-create noteworthy-collab-log-buffer)
       (goto-char (point-max))
       (let ((inhibit-read-only t))
-        (insert (propertize 
+        (insert (propertize
                  (format "[%s] " timestamp)
                  'face 'font-lock-comment-face)
-                (propertize 
+                (propertize
                  (format "[%s] " level-str)
                  'face (pcase level
                          ('error 'error)
                          ('warn 'warning)
                          (_ 'font-lock-keyword-face)))
-                msg "\n"))
+                msg "\n")
+        ;; Cap the buffer so high-frequency raw-payload logging can't grow it
+        ;; without bound.
+        (when (> (line-number-at-pos (point-max)) noteworthy-collab-log-max-lines)
+          (save-excursion
+            (goto-char (point-min))
+            (forward-line (- (line-number-at-pos (point-max))
+                             noteworthy-collab-log-max-lines))
+            (delete-region (point-min) (point)))))
       ;; Auto-scroll if visible
       (when-let ((win (get-buffer-window (current-buffer))))
         (with-selected-window win
@@ -201,9 +251,10 @@ MSG contains userId, name, color, text, timestamp."
   "Send a chat MESSAGE to the server."
   (interactive "sChat: ")
   (when (not (string-empty-p message))
-    (noteworthy-collab--send
-     `((type . "chat")
-       (message . ,message)))))
+    (unless (noteworthy-collab--send
+             `((type . "chat")
+               (message . ,message)))
+      (message "Noteworthy collab: chat message not sent -- not connected to server"))))
 
 (defun noteworthy-collab-show-terminal ()
   "Switch bottom window to vterm."
@@ -298,6 +349,7 @@ If MODE-CHECK (symbol) is provided, it tries to find a window with that major-mo
   "Handle WebSocket close."
   (noteworthy-collab--log 'warn "Disconnected from server")
   (setq noteworthy-collab--socket nil)
+  (noteworthy-collab--mark-buffers-read-only)
   (noteworthy-collab--schedule-reconnect))
 
 (defun noteworthy-collab--on-error (_ws _type err)
@@ -309,7 +361,7 @@ If MODE-CHECK (symbol) is provided, it tries to find a window with that major-mo
   (condition-case err
       (let* ((payload (websocket-frame-text frame))
              (msg (json-parse-string payload :object-type 'alist)))
-        (noteworthy-collab--log 'info "RECV raw: %s" payload)
+        (noteworthy-collab--log 'info "RECV raw: %s" (noteworthy-collab--truncate-for-log payload))
         (noteworthy-collab--handle-message msg))
     (error
      (noteworthy-collab--log 'error "Message parse error: %s" (error-message-string err)))))
@@ -327,14 +379,22 @@ If MODE-CHECK (symbol) is provided, it tries to find a window with that major-mo
                               (noteworthy-collab--connect noteworthy-collab--server-url)))))))
 
 (defun noteworthy-collab--send (msg)
-  "Send MSG (alist) to server as JSON."
-  (if (not noteworthy-collab--socket)
-      (noteworthy-collab--log 'error "SEND failed: No socket")
-    (if (not (websocket-openp noteworthy-collab--socket))
-        (noteworthy-collab--log 'error "SEND failed: Socket not open")
-      (let ((json-str (json-encode msg)))
-        (noteworthy-collab--log 'info "SEND raw: %s" json-str)
-        (websocket-send-text noteworthy-collab--socket json-str)))))
+  "Send MSG (alist) to server as JSON.  Return non-nil on success.
+Callers that act on explicit user commands (chat, join, ...) should check
+the return value and report failure -- this function only logs to the
+(usually hidden) log buffer."
+  (cond
+   ((not noteworthy-collab--socket)
+    (noteworthy-collab--log 'error "SEND failed: No socket")
+    nil)
+   ((not (websocket-openp noteworthy-collab--socket))
+    (noteworthy-collab--log 'error "SEND failed: Socket not open")
+    nil)
+   (t
+    (let ((json-str (json-encode msg)))
+      (noteworthy-collab--log 'info "SEND raw: %s" (noteworthy-collab--truncate-for-log json-str))
+      (websocket-send-text noteworthy-collab--socket json-str)
+      t))))
 
 (defun noteworthy-collab-connected-p ()
   "Return non-nil if connected to server."
@@ -504,10 +564,13 @@ Vectors are converted to lists; other non-list values return nil."
           range))))))
 
 (defun noteworthy-collab--line-col-at-pos (pos)
-  "Return (LINE . COL) at POS."
+  "Return (LINE . COL) at POS.
+COL is a character offset from the line start, not a display column --
+`current-column' disagrees with the web client's column model whenever
+the line has a tab in it."
   (save-excursion
     (goto-char pos)
-    (cons (line-number-at-pos) (current-column))))
+    (cons (line-number-at-pos) (- pos (line-beginning-position)))))
 
 (defun noteworthy-collab--store-remote-user (msg)
   "Store user identity and position fields from MSG."
@@ -569,15 +632,48 @@ Vectors are converted to lists; other non-list values return nil."
         ;; `inhibit-modification-hooks': that would also silence typst-preview's
         ;; and eglot's after-change hooks, which are what carry a peer's edit to
         ;; the preview and the LSP.
-        (let ((noteworthy-collab--applying-remote t)
-              (pos (point)))
-          (erase-buffer)
-          (insert content)
-          (setq noteworthy-collab--version version)
-          ;; Try to restore position
-          (goto-char (min pos (point-max))))
+        ;;
+        ;; A snippet's overlays/markers and every remote-cursor overlay point
+        ;; into text this is about to delete outright -- clean both up before
+        ;; `erase-buffer', not after.  yasnippet is optional: guard with
+        ;; fboundp/bound-and-true-p so it stays that way.
+        (when (and (bound-and-true-p yas-minor-mode)
+                   (fboundp 'yas-active-snippets)
+                   (fboundp 'yas-abort-snippet))
+          (dolist (snippet (yas-active-snippets))
+            (yas-abort-snippet snippet)))
+        (noteworthy-collab--clear-cursor-overlays-in-buffer buf)
+        ;; `erase-buffer' silently widens; save-restriction/widen makes sure
+        ;; that's temporary and the user's own narrowing survives the sync.
+        (save-restriction
+          (widen)
+          (let ((noteworthy-collab--applying-remote t)
+                ;; Buffers can be forced read-only while disconnected (see
+                ;; `noteworthy-collab--mark-buffers-read-only') or already be
+                ;; read-only on their own; either way the sync itself must go
+                ;; through.
+                (inhibit-read-only t)
+                (pos (point))
+                (window-points (mapcar (lambda (w) (cons w (window-point w)))
+                                       (get-buffer-window-list buf nil t))))
+            (erase-buffer)
+            (insert content)
+            (setq noteworthy-collab--version version)
+            ;; Try to restore position, in this window and every other window
+            ;; showing the buffer.
+            (goto-char (min pos (point-max)))
+            (dolist (wp window-points)
+              (when (window-live-p (car wp))
+                (set-window-point (car wp) (min (cdr wp) (point-max)))))))
+        ;; This sync is authoritative content: whatever read-only state we
+        ;; imposed while disconnected (or the user's own, if that's what we
+        ;; saved) can now be restored, and it's safe to let local edits
+        ;; through again.
+        (noteworthy-collab--restore-read-only)
+        (setq noteworthy-collab--synced t)
+        (setq noteworthy-collab--sync-warned nil)
         (noteworthy-collab--notify-preview)
-        (noteworthy-collab--log 'info "Synced %s (v%s, %d chars)" 
+        (noteworthy-collab--log 'info "Synced %s (v%s, %d chars)"
                                 file version (length content))))))
 
 (defun noteworthy-collab--apply-delta (msg)
@@ -602,13 +698,20 @@ Vectors are converted to lists; other non-list values return nil."
         ;; parsers below the Lisp hook layer, so the parse tree is already
         ;; up to date by the time we return.  Only fontification needs a nudge,
         ;; scoped to the text we touched.
-        (let* ((noteworthy-collab--applying-remote t)
-               (range (noteworthy-collab--apply-ops ops)))
-          ;; Widen by one char so a pure deletion (beg == end) still
-          ;; refontifies the text that closed over the gap.
-          (when range
-            (font-lock-flush (max (point-min) (1- (car range)))
-                             (min (point-max) (1+ (cdr range))))))
+        ;;
+        ;; `--apply-ops' walks from (point-min), which under narrowing is not
+        ;; absolute position 1 -- but the ops' retain/delete counts came from
+        ;; the sender's absolute buffer positions.  Widen so they land on the
+        ;; same text the sender meant, and restore the user's narrowing after.
+        (save-restriction
+          (widen)
+          (let* ((noteworthy-collab--applying-remote t)
+                 (range (noteworthy-collab--apply-ops ops)))
+            ;; Widen by one char so a pure deletion (beg == end) still
+            ;; refontifies the text that closed over the gap.
+            (when range
+              (font-lock-flush (max (point-min) (1- (car range)))
+                               (min (point-max) (1+ (cdr range)))))))
         (noteworthy-collab--notify-preview)))))
 
 (defun noteworthy-collab--notify-preview ()
@@ -688,9 +791,11 @@ MSG accepts both legacy and canonical selection fields."
          (effective-file (or file 
                               noteworthy-collab--file-path
                               (plist-get (gethash user-id noteworthy-collab--remote-users) :file)))
-         (buf (if effective-file
-                  (noteworthy-collab--find-buffer-for-file effective-file)
-                (current-buffer))))
+         ;; No buffer to resolve means no buffer to draw into -- creating the
+         ;; overlay in whatever happened to be `current-buffer' when the
+         ;; packet arrived was the bug.
+         (buf (and effective-file
+                   (noteworthy-collab--find-buffer-for-file effective-file))))
     (when (and user-id
                (not (and noteworthy-collab--user-id
                          (string= user-id noteworthy-collab--user-id))))
@@ -763,6 +868,19 @@ MSG accepts both legacy and canonical selection fields."
     (when (cdr overlays) (delete-overlay (cdr overlays)))
     (remhash user-id noteworthy-collab--remote-cursors)))
 
+(defun noteworthy-collab--clear-cursor-overlays-in-buffer (buf)
+  "Remove every remote cursor/selection overlay that lives in BUF.
+Used before `erase-buffer' in `noteworthy-collab--apply-sync': overlays left
+behind there would either vanish uncleanly or end up pointing at nothing."
+  (let (stale)
+    (maphash (lambda (user-id overlays)
+               (when (or (and (car overlays) (eq (overlay-buffer (car overlays)) buf))
+                         (and (cdr overlays) (eq (overlay-buffer (cdr overlays)) buf)))
+                 (push user-id stale)))
+             noteworthy-collab--remote-cursors)
+    (dolist (user-id stale)
+      (noteworthy-collab--clear-cursor-overlays user-id))))
+
 (defun noteworthy-collab--update-users (msg)
   "Handle users list update."
   (let* ((file (alist-get 'file msg))
@@ -784,31 +902,85 @@ MSG accepts both legacy and canonical selection fields."
 (defvar noteworthy-collab--global-auto-save-disabled nil
   "Whether we've disabled global auto-save features.")
 
+(defvar noteworthy-collab--disabled-global-features nil
+  "Which global minor modes `--disable-global-auto-save' actually turned off.
+A subset of (auto-save-visited-mode super-save-mode ws-butler-global-mode);
+only modes that were active get recorded, so restoring doesn't turn one on
+that the user never had enabled.")
+
+(defvar noteworthy-collab--removed-focus-out-hooks nil
+  "Which `focus-out-hook' functions `--disable-global-auto-save' removed.
+Only functions that were actually present get recorded.")
+
 (defun noteworthy-collab--disable-global-auto-save ()
-  "Disable all global auto-save mechanisms."
+  "Disable all global auto-save mechanisms.
+Records exactly what was turned off, in `noteworthy-collab--disabled-global-features'
+and `noteworthy-collab--removed-focus-out-hooks', so `noteworthy-collab-disconnect'
+can put it back the way it found it."
   (unless noteworthy-collab--global-auto-save-disabled
     (setq noteworthy-collab--global-auto-save-disabled t)
-    
+    (setq noteworthy-collab--disabled-global-features nil)
+    (setq noteworthy-collab--removed-focus-out-hooks nil)
+
     ;; Disable auto-save-visited-mode if active
     (when (bound-and-true-p auto-save-visited-mode)
       (auto-save-visited-mode -1)
+      (push 'auto-save-visited-mode noteworthy-collab--disabled-global-features)
       (noteworthy-collab--log 'info "Disabled auto-save-visited-mode"))
-    
+
     ;; Disable super-save-mode if active (common in Doom)
     (when (bound-and-true-p super-save-mode)
       (super-save-mode -1)
+      (push 'super-save-mode noteworthy-collab--disabled-global-features)
       (noteworthy-collab--log 'info "Disabled super-save-mode"))
-    
+
     ;; Disable ws-butler auto-trim (can trigger saves)
     (when (bound-and-true-p ws-butler-global-mode)
       (ws-butler-global-mode -1)
+      (push 'ws-butler-global-mode noteworthy-collab--disabled-global-features)
       (noteworthy-collab--log 'info "Disabled ws-butler-global-mode"))
-    
+
     ;; Remove save hooks that might auto-trigger
-    (remove-hook 'focus-out-hook #'save-some-buffers)
-    (remove-hook 'focus-out-hook #'doom-auto-save-non-file-buffers-h)
-    
+    (when (memq #'save-some-buffers focus-out-hook)
+      (remove-hook 'focus-out-hook #'save-some-buffers)
+      (push #'save-some-buffers noteworthy-collab--removed-focus-out-hooks))
+    (when (memq #'doom-auto-save-non-file-buffers-h focus-out-hook)
+      (remove-hook 'focus-out-hook #'doom-auto-save-non-file-buffers-h)
+      (push #'doom-auto-save-non-file-buffers-h noteworthy-collab--removed-focus-out-hooks))
+
     (noteworthy-collab--log 'info "Global auto-save features disabled")))
+
+(defun noteworthy-collab--restore-global-auto-save ()
+  "Undo `noteworthy-collab--disable-global-auto-save'.
+Restores only what that function actually recorded turning off."
+  (when noteworthy-collab--global-auto-save-disabled
+    (dolist (feature noteworthy-collab--disabled-global-features)
+      (pcase feature
+        ('auto-save-visited-mode (auto-save-visited-mode 1))
+        ('super-save-mode (super-save-mode 1))
+        ('ws-butler-global-mode (ws-butler-global-mode 1))))
+    (dolist (fn noteworthy-collab--removed-focus-out-hooks)
+      (add-hook 'focus-out-hook fn))
+    (setq noteworthy-collab--disabled-global-features nil
+          noteworthy-collab--removed-focus-out-hooks nil
+          noteworthy-collab--global-auto-save-disabled nil)
+    (noteworthy-collab--log 'info "Restored global auto-save features")))
+
+(defun noteworthy-collab--mark-buffers-read-only ()
+  "Make every active collab buffer read-only.
+The server owns the file and `noteworthy-collab--apply-sync' replaces the
+whole buffer on resync -- there is no merge, so anything typed while
+disconnected would silently vanish.  Blocking edits is the safe failure
+mode; `--apply-sync' restores each buffer's own prior read-only state once
+it resyncs."
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (and noteworthy-collab--active
+                 (eq noteworthy-collab--saved-read-only noteworthy-collab--unset))
+        (setq noteworthy-collab--saved-read-only buffer-read-only)
+        (setq buffer-read-only t)
+        (message "Noteworthy collab: disconnected -- %s is read-only until it resyncs, to avoid losing edits"
+                 (buffer-name buf))))))
 
 (defun noteworthy-collab--setup-buffer ()
   "Setup collaboration for current buffer."
@@ -845,6 +1017,14 @@ MSG accepts both legacy and canonical selection fields."
                           (buffer-name)
                           (length after-change-functions)))
 
+(defun noteworthy-collab--restore-read-only ()
+  "Undo the read-only state forced on this buffer while disconnected.
+Does nothing if we never forced it, so a buffer the user made read-only
+themselves stays that way."
+  (unless (eq noteworthy-collab--saved-read-only noteworthy-collab--unset)
+    (setq buffer-read-only noteworthy-collab--saved-read-only)
+    (setq noteworthy-collab--saved-read-only noteworthy-collab--unset)))
+
 (defun noteworthy-collab--teardown-buffer ()
   "Remove collaboration from current buffer."
   (setq noteworthy-collab--active nil)
@@ -854,6 +1034,11 @@ MSG accepts both legacy and canonical selection fields."
     (setq buffer-auto-save-file-name noteworthy-collab--saved-auto-save)
     (noteworthy-collab--log 'info "Restored auto-save for: %s" (buffer-name)))
   
+  ;; A deliberate disconnect also closes the socket, which forces buffers
+  ;; read-only; nothing would ever restore them, so do it here.
+  (noteworthy-collab--restore-read-only)
+  (setq noteworthy-collab--synced nil)
+
   ;; Stop shadowing this file: tinymist must fall back to the copy on disk,
   ;; which the room keeps current.
   (noteworthy-collab-preview-drop)
@@ -880,30 +1065,47 @@ LEN is length of deleted text."
   ;; Use condition-case to prevent errors from propagating to other hooks
   (condition-case err
       (unless noteworthy-collab--applying-remote
-        (if (not noteworthy-collab--file-path)
-            (noteworthy-collab--log 'info "after-change: No file-path set (buffer: %s)" (buffer-name))
-          (if (not (noteworthy-collab-connected-p))
-              (noteworthy-collab--log 'info "after-change: Not connected")
-            (let ((inserted (buffer-substring-no-properties beg end))
-                  (ops '()))
-              ;; Build delta ops (0-indexed positions)
-              ;; Each op must be an alist for proper JSON encoding
-              (when (> (1- beg) 0)
-                (push `((retain . ,(1- beg))) ops))
-              (when (> len 0)
-                (push `((delete . ,len)) ops))
-              (when (> (length inserted) 0)
-                (push `((insert . ,inserted)) ops))
-              ;; Send to server
-              (if ops
-                  (let ((final-ops (vconcat (nreverse ops))))
-                    (noteworthy-collab--log 'info "SEND delta: file=%s beg=%d end=%d len=%d ops=%s" 
-                                            noteworthy-collab--file-path beg end len final-ops)
-                    (noteworthy-collab--send
-                     `((type . "delta")
-                       (file . ,noteworthy-collab--file-path)
-                       (ops . ,final-ops))))
-                (noteworthy-collab--log 'info "after-change: No ops generated (inserted='%s')" inserted))))))
+        (cond
+         ((not noteworthy-collab--file-path)
+          (noteworthy-collab--log 'info "after-change: No file-path set (buffer: %s)" (buffer-name)))
+         ;; The authoritative sync for this buffer hasn't landed yet: sending
+         ;; now would compute retain/delete offsets against content the
+         ;; server doesn't recognize.  Warn once, not on every keystroke.
+         ((not noteworthy-collab--synced)
+          (unless noteworthy-collab--sync-warned
+            (setq noteworthy-collab--sync-warned t)
+            (message "Noteworthy collab: %s hasn't synced yet -- this edit was NOT sent"
+                     (buffer-name)))
+          (noteworthy-collab--log 'warn "after-change: dropped edit, not yet synced"))
+         ;; Buffers are forced read-only while disconnected (see
+         ;; `noteworthy-collab--mark-buffers-read-only') specifically so we
+         ;; never get here; this is the fallback for a user who forces an
+         ;; edit through anyway (e.g. via `inhibit-read-only').  Warn
+         ;; visibly rather than silently dropping it.
+         ((not (noteworthy-collab-connected-p))
+          (message "Noteworthy collab: not connected -- this edit was NOT sent and will be lost")
+          (noteworthy-collab--log 'error "after-change: dropped edit, not connected"))
+         (t
+          (let ((inserted (buffer-substring-no-properties beg end))
+                (ops '()))
+            ;; Build delta ops (0-indexed positions)
+            ;; Each op must be an alist for proper JSON encoding
+            (when (> (1- beg) 0)
+              (push `((retain . ,(1- beg))) ops))
+            (when (> len 0)
+              (push `((delete . ,len)) ops))
+            (when (> (length inserted) 0)
+              (push `((insert . ,inserted)) ops))
+            ;; Send to server
+            (if ops
+                (let ((final-ops (vconcat (nreverse ops))))
+                  (noteworthy-collab--log 'info "SEND delta: file=%s beg=%d end=%d len=%d ops=%s"
+                                          noteworthy-collab--file-path beg end len final-ops)
+                  (noteworthy-collab--send
+                   `((type . "delta")
+                     (file . ,noteworthy-collab--file-path)
+                     (ops . ,final-ops))))
+              (noteworthy-collab--log 'info "after-change: No ops generated (inserted='%s')" inserted))))))
     (error
      (noteworthy-collab--log 'error "after-change error: %s" (error-message-string err)))))
 
@@ -932,7 +1134,10 @@ LEN is length of deleted text."
     (let ((msg `((type . "cursor")
                  (file . ,noteworthy-collab--file-path)
                  (line . ,(line-number-at-pos))
-                 (col . ,(current-column)))))
+                 ;; Character offset from line start, not `current-column' --
+                 ;; that's a DISPLAY column and disagrees with the web
+                 ;; client's character column whenever the line has a tab.
+                 (col . ,(- (point) (line-beginning-position))))))
       ;; Add selection info in canonical line/column fields.
       ;; Keep legacy object shape for bridge compatibility during transition.
       (when (region-active-p)
@@ -961,10 +1166,16 @@ LEN is length of deleted text."
 ;;; ============================================================
 
 (defun noteworthy-collab--join-file-internal (file-path)
-  "Internal: Send join message for FILE-PATH."
-  (noteworthy-collab--send
-   `((type . "join")
-     (file . ,file-path))))
+  "Internal: Send join message for FILE-PATH.
+Every join or rejoin passes through here, so this is where we clear
+`noteworthy-collab--synced': the buffer isn't trustworthy again until the
+matching \"sync\" arrives and `noteworthy-collab--apply-sync' sets it."
+  (setq noteworthy-collab--synced nil)
+  (setq noteworthy-collab--sync-warned nil)
+  (unless (noteworthy-collab--send
+           `((type . "join")
+             (file . ,file-path)))
+    (message "Noteworthy collab: failed to join %s -- not connected to server" file-path)))
 
 (defun noteworthy-collab-join-file (file-path)
   "Join collaboration session for FILE-PATH."
@@ -1008,31 +1219,41 @@ LEN is length of deleted text."
   (noteworthy-collab--log 'info "on-find-file hook: %s" (buffer-file-name))
   (when-let ((file (buffer-file-name)))
     (noteworthy-collab--log 'info "  project-root: %s" noteworthy-collab--project-root)
-    (noteworthy-collab--log 'info "  is-project-file?: %s" (noteworthy-collab--is-project-file-p file))
     (noteworthy-collab--log 'info "  is-typ?: %s" (string-suffix-p ".typ" file))
+    ;; Check the cheap local suffix test before `--is-project-file-p', and
+    ;; call it only once: each call is a remote stat when FILE is over
+    ;; TRAMP, so this was costing every opened file two round-trips.
     (when (and noteworthy-collab--project-root
-               (noteworthy-collab--is-project-file-p file)
                (string-suffix-p ".typ" file))
-      (let ((rel-path (noteworthy-collab--relative-path file)))
-        (noteworthy-collab--log 'info "  rel-path: %s" rel-path)
-        (noteworthy-collab-join-file rel-path)))))
+      (let ((project-file-p (noteworthy-collab--is-project-file-p file)))
+        (noteworthy-collab--log 'info "  is-project-file?: %s" project-file-p)
+        (when project-file-p
+          (let ((rel-path (noteworthy-collab--relative-path file)))
+            (noteworthy-collab--log 'info "  rel-path: %s" rel-path)
+            (noteworthy-collab-join-file rel-path)))))))
 
 ;;; ============================================================
 ;;; Server Status & Preview Discovery
 ;;; ============================================================
 
 (defun noteworthy-collab--fetch-server-status (http-url callback)
-  "Fetch server status from HTTP-URL/api/status and call CALLBACK with result."
+  "Fetch server status from HTTP-URL/api/status and call CALLBACK with result.
+CALLBACK is invoked exactly once, with nil on any failure (refused
+connection, timeout, or a malformed response) so callers' fallback logic
+always runs."
   (let ((url (concat http-url "/api/status")))
     (url-retrieve
      url
-     (lambda (_status)
-       (goto-char (point-min))
-       (when (re-search-forward "\n\n" nil t)
-         (condition-case nil
-             (let ((json-data (json-parse-buffer :object-type 'alist)))
-               (funcall callback json-data))
-           (error (funcall callback nil)))))
+     (lambda (status)
+       (if (plist-get status :error)
+           (funcall callback nil)
+         (goto-char (point-min))
+         (if (re-search-forward "\n\n" nil t)
+             (condition-case nil
+                 (let ((json-data (json-parse-buffer :object-type 'alist)))
+                   (funcall callback json-data))
+               (error (funcall callback nil)))
+           (funcall callback nil))))
      nil t t)))
 
 
@@ -1180,7 +1401,14 @@ This sets up:
   
   ;; Remove hook
   (remove-hook 'find-file-hook #'noteworthy-collab--on-find-file)
-  
+
+  ;; Undo whatever global auto-save features we actually turned off
+  (noteworthy-collab--restore-global-auto-save)
+
+  ;; Drop tinymist memory overlays, so the preview follows the files on disk
+  ;; again instead of a buffer we are no longer syncing.
+  (noteworthy-collab-preview-disconnect)
+
   ;; Clear state
   (setq noteworthy-collab--project-root nil
         noteworthy-collab--server-url nil

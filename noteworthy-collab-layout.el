@@ -7,6 +7,8 @@
 (require 'treemacs)
 (require 'pdf-tools)
 (require 'vterm)
+;; cl-find-if below is not autoloaded.
+(require 'cl-lib)
 
 ;;; ============================================================
 ;;; Variables
