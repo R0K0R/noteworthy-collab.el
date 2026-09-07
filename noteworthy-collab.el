@@ -173,10 +173,12 @@ FMT and ARGS are passed to `format'."
 
 (defun noteworthy-collab--display-chat (msg)
   "Display chat message MSG in the chat buffer.
-MSG contains userId, name, color, message, timestamp."
+MSG contains userId, name, color, text, timestamp."
+  ;; The server broadcasts the body as `text' (document_hub.send_chat); older
+  ;; bridge builds used `message'.  Accept either, and never insert nil.
   (let* ((name (alist-get 'name msg))
          (color (alist-get 'color msg))
-         (text (alist-get 'message msg))
+         (text (or (alist-get 'text msg) (alist-get 'message msg) ""))
          (timestamp (format-time-string "%H:%M:%S" 
                                         (seconds-to-time (/ (or (alist-get 'timestamp msg) 0) 1000))))
          (buf (get-buffer-create noteworthy-collab-chat-buffer)))
@@ -561,14 +563,19 @@ Vectors are converted to lists; other non-list values return nil."
          (buf (noteworthy-collab--find-buffer-for-file file)))
     (when buf
       (with-current-buffer buf
+        ;; `noteworthy-collab--applying-remote' alone stops the echo (see
+        ;; `noteworthy-collab--after-change').  We deliberately do NOT bind
+        ;; `inhibit-modification-hooks': that would also silence typst-preview's
+        ;; and eglot's after-change hooks, which are what carry a peer's edit to
+        ;; the preview and the LSP.
         (let ((noteworthy-collab--applying-remote t)
-              (inhibit-modification-hooks t)
               (pos (point)))
           (erase-buffer)
           (insert content)
           (setq noteworthy-collab--version version)
           ;; Try to restore position
           (goto-char (min pos (point-max))))
+        (noteworthy-collab--notify-preview)
         (noteworthy-collab--log 'info "Synced %s (v%s, %d chars)" 
                                 file version (length content))))))
 
@@ -584,40 +591,79 @@ Vectors are converted to lists; other non-list values return nil."
                          noteworthy-collab--user-id
                          (string= user-id noteworthy-collab--user-id))))
       (with-current-buffer buf
-        (let ((noteworthy-collab--applying-remote t)
-              (inhibit-modification-hooks t))
-          (noteworthy-collab--apply-ops ops)
-          ;; Force syntax highlighting refresh after remote edit
-          (font-lock-flush)
-          ;; Update treesit if available
-          (when (and (fboundp 'treesit-parser-list)
-                     (treesit-parser-list))
-            (treesit-update-ranges)))))))
+        ;; Modification hooks stay LIVE for remote edits: that is how
+        ;; typst-preview pushes the buffer to tinymist (updateMemoryFiles) and
+        ;; how eglot keeps the LSP mirror current.  Echo is prevented by
+        ;; `noteworthy-collab--applying-remote', which
+        ;; `noteworthy-collab--after-change' checks.
+        ;;
+        ;; Tree-sitter needs no help here: Emacs records buffer changes for
+        ;; parsers below the Lisp hook layer, so the parse tree is already
+        ;; up to date by the time we return.  Only fontification needs a nudge,
+        ;; scoped to the text we touched.
+        (let* ((noteworthy-collab--applying-remote t)
+               (range (noteworthy-collab--apply-ops ops)))
+          ;; Widen by one char so a pure deletion (beg == end) still
+          ;; refontifies the text that closed over the gap.
+          (when range
+            (font-lock-flush (max (point-min) (1- (car range)))
+                             (min (point-max) (1+ (cdr range))))))
+        (noteworthy-collab--notify-preview)))))
+
+(defun noteworthy-collab--notify-preview ()
+  "Push the current buffer to a live typst-preview session.
+
+Usually redundant: `typst-preview--send-buffer-on-type' sits on
+`after-change-functions' and now fires on its own for remote edits.  This
+covers the case where a preview session is attached but that buffer-local
+hook is not installed."
+  (when (and buffer-file-name
+             (not (memq #'typst-preview--send-buffer-on-type after-change-functions))
+             (fboundp 'typst-preview-connected-p)
+             (fboundp 'typst-preview--send-buffer)
+             (ignore-errors (typst-preview-connected-p)))
+    (condition-case err
+        (typst-preview--send-buffer)
+      (error
+       (noteworthy-collab--log 'warn "Preview notify failed: %s"
+                               (error-message-string err))))))
 
 (defun noteworthy-collab--apply-ops (ops)
   "Apply delta OPS to current buffer with bounds checking.
 OPS is a vector/list of operations like:
-  [{\"retain\": 10}, {\"insert\": \"hello\"}, {\"delete\": 5}]"
-  (save-excursion
-    (goto-char (point-min))
-    (let ((ops-list (if (vectorp ops) (append ops nil) ops)))
-      (dolist (op ops-list)
-        (condition-case err
-            (cond
-             ((alist-get 'retain op)
-              (let ((count (alist-get 'retain op))
-                    (remaining (- (point-max) (point))))
-                ;; Clamp retain to remaining buffer
-                (forward-char (min count remaining))))
-             ((alist-get 'insert op)
-              (insert (alist-get 'insert op)))
-             ((alist-get 'delete op)
-              (let ((count (alist-get 'delete op))
-                    (remaining (- (point-max) (point))))
-                ;; Clamp delete to remaining buffer
-                (delete-char (min count remaining)))))
-          (error
-           (noteworthy-collab--log 'warn "Op error: %s (op: %s)" err op)))))))
+  [{\"retain\": 10}, {\"insert\": \"hello\"}, {\"delete\": 5}]
+
+Return (BEG . END) covering the text actually touched, or nil if nothing
+changed.  Callers use it to scope refontification."
+  (let (beg end)
+    (save-excursion
+      (goto-char (point-min))
+      (let ((ops-list (if (vectorp ops) (append ops nil) ops)))
+        (dolist (op ops-list)
+          (condition-case err
+              (cond
+               ((alist-get 'retain op)
+                (let ((count (alist-get 'retain op))
+                      (remaining (- (point-max) (point))))
+                  ;; Clamp retain to remaining buffer
+                  (forward-char (min count remaining))))
+               ((alist-get 'insert op)
+                (let ((start (point)))
+                  (insert (alist-get 'insert op))
+                  (setq beg (min (or beg start) start)
+                        end (max (or end (point)) (point)))))
+               ((alist-get 'delete op)
+                (let* ((count (alist-get 'delete op))
+                       (remaining (- (point-max) (point)))
+                       (start (point)))
+                  ;; Clamp delete to remaining buffer
+                  (delete-char (min count remaining))
+                  (setq beg (min (or beg start) start)
+                        end (max (or end start) start)))))
+            (error
+             (noteworthy-collab--log 'warn "Op error: %s (op: %s)" err op))))))
+    (when (and beg end)
+      (cons beg end))))
 
 (defun noteworthy-collab--show-cursor (msg)
   "Show remote user's cursor and selection.

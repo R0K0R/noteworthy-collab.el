@@ -34,7 +34,7 @@ If nil, uses default shell.")
   "URL for tinymist preview (port-forwarded).
 If nil, preview is skipped.")
 
-(defvar noteworthy-collab-settings-file 
+(defvar noteworthy-collab-settings-file
   (expand-file-name "noteworthy-collab-settings.el" user-emacs-directory)
   "File to store layout settings.")
 
@@ -72,7 +72,7 @@ Call this after any operation that might cause Treemacs to switch roots."
     (when (window-live-p editor-window)
       (select-window editor-window)
       (let* ((pdf-window (split-window editor-window nil 'right))
-             (target-width (or noteworthy-collab-pdf-width 
+             (target-width (or noteworthy-collab-pdf-width
                                (round (* 0.35 (frame-width)))))
              (current-width (window-total-width pdf-window))
              (delta (- target-width current-width)))
@@ -97,7 +97,7 @@ Call this after any operation that might cause Treemacs to switch roots."
 (defun noteworthy-collab--setup-preview-window (editor-window)
   "Setup xwidget preview window next to EDITOR-WINDOW.
 If `noteworthy-collab-preview-url` is nil, creates a placeholder buffer."
-  (message "DEBUG: setup-preview-window called. URL: %s, xwidgets: %s" 
+  (message "DEBUG: setup-preview-window called. URL: %s, xwidgets: %s"
            noteworthy-collab-preview-url (featurep 'xwidget-internal))
   (when (window-live-p editor-window)
     (select-window editor-window)
