@@ -107,13 +107,21 @@ retain/delete offsets against content the server doesn't recognize, so
   "Non-nil once we've warned the user about editing before `--synced'.
 Keeps that warning to once per buffer instead of once per keystroke.")
 
-(defconst noteworthy-collab--unset (make-symbol "noteworthy-collab--unset")
-  "Sentinel distinguishing \"no saved value\" from a saved nil.")
+(defconst noteworthy-collab--unset :noteworthy-collab-unset
+  "Sentinel distinguishing \"no saved value\" from a saved nil.
+Deliberately an interned keyword, not `make-symbol': reloading this file
+would mint a fresh uninterned symbol while `defvar-local' keeps the old one
+as its default (defvar does not re-evaluate), so every `eq' test against it
+would quietly fail -- and the stale sentinel, being truthy, would end up
+assigned to `buffer-read-only'.")
 
 (defvar-local noteworthy-collab--saved-read-only noteworthy-collab--unset
   "This buffer's own `buffer-read-only' from before we forced it read-only
 while disconnected (see `noteworthy-collab--mark-buffers-read-only').  The
 sentinel `noteworthy-collab--unset' means we haven't forced it.")
+;; `defvar-local' does not re-evaluate on reload; refresh the default so a
+;; reloaded file and its already-open buffers agree.
+(setq-default noteworthy-collab--saved-read-only noteworthy-collab--unset)
 
 (defvar noteworthy-collab--remote-cursors (make-hash-table :test 'equal)
   "Hash-table mapping user-id -> (cursor-overlay . selection-overlay).")
@@ -345,12 +353,18 @@ If MODE-CHECK (symbol) is provided, it tries to find a window with that major-mo
   (when noteworthy-collab--server-url
     (noteworthy-collab--infer-preview-url noteworthy-collab--server-url)))
 
+(defvar noteworthy-collab--disconnecting nil
+  "Non-nil while `noteworthy-collab-disconnect' is tearing the session down.
+The read-only guard exists to protect edits that would be lost by an
+*unexpected* drop; a deliberate disconnect must leave buffers editable.")
+
 (defun noteworthy-collab--on-close (_ws)
   "Handle WebSocket close."
   (noteworthy-collab--log 'warn "Disconnected from server")
   (setq noteworthy-collab--socket nil)
-  (noteworthy-collab--mark-buffers-read-only)
-  (noteworthy-collab--schedule-reconnect))
+  (unless noteworthy-collab--disconnecting
+    (noteworthy-collab--mark-buffers-read-only)
+    (noteworthy-collab--schedule-reconnect)))
 
 (defun noteworthy-collab--on-error (_ws _type err)
   "Handle WebSocket error."
@@ -977,8 +991,8 @@ it resyncs."
   (dolist (buf (buffer-list))
     (with-current-buffer buf
       (when (and noteworthy-collab--active
-                 (eq noteworthy-collab--saved-read-only noteworthy-collab--unset))
-        (setq noteworthy-collab--saved-read-only buffer-read-only)
+                 (not (memq noteworthy-collab--saved-read-only '(t nil))))
+        (setq noteworthy-collab--saved-read-only (and buffer-read-only t))
         (setq buffer-read-only t)
         (message "Noteworthy collab: disconnected -- %s is read-only until it resyncs, to avoid losing edits"
                  (buffer-name buf))))))
@@ -1022,7 +1036,7 @@ it resyncs."
   "Undo the read-only state forced on this buffer while disconnected.
 Does nothing if we never forced it, so a buffer the user made read-only
 themselves stays that way."
-  (unless (eq noteworthy-collab--saved-read-only noteworthy-collab--unset)
+  (when (memq noteworthy-collab--saved-read-only '(t nil))
     (setq buffer-read-only noteworthy-collab--saved-read-only)
     (setq noteworthy-collab--saved-read-only noteworthy-collab--unset)))
 
@@ -1385,6 +1399,7 @@ This sets up:
 (defun noteworthy-collab-disconnect ()
   "Disconnect from collaboration server and cleanup."
   (interactive)
+  (setq noteworthy-collab--disconnecting t)
   ;; Leave all active files
   (dolist (buf (buffer-list))
     (with-current-buffer buf
@@ -1417,6 +1432,9 @@ This sets up:
         noteworthy-collab--user-id nil
         noteworthy-collab--user-color nil)
   
+  ;; Any buffer we forced read-only is editable again by now (teardown
+  ;; restored it, and --on-close no longer re-marks it).
+  (setq noteworthy-collab--disconnecting nil)
   (noteworthy-collab--log 'info "Disconnected"))
 
 ;;;###autoload
