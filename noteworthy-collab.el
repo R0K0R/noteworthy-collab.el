@@ -1,0 +1,1205 @@
+;;; noteworthy-collab.el --- Real-time collaboration for Noteworthy -*- lexical-binding: t; -*-
+
+;; Author: r0k0r
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "29.1") (websocket "1.14") (typst-ts-mode "0.1"))
+;; Keywords: typst, collaboration, tools
+;; URL: https://github.com/R0K0R/noteworthy-collab.el
+
+;;; Commentary:
+;; Real-time collaborative editing for Noteworthy Typst projects.
+;; Connects to a remote server via WebSocket and uses CRDT for conflict-free sync.
+;; All editing goes through the server - no local file saves.
+
+;;; Code:
+
+(require 'websocket)
+(require 'json)
+(require 'url-util)
+
+;; Load companion modules
+(require 'noteworthy-typst)
+
+(with-eval-after-load 'evil
+  (require 'noteworthy-evil))
+
+(require 'noteworthy-collab-layout)
+(require 'noteworthy-collab-keys)
+
+;;; ============================================================
+;;; Customization
+;;; ============================================================
+
+(defgroup noteworthy-collab nil
+  "Real-time collaboration for Noteworthy."
+  :group 'tools
+  :prefix "noteworthy-collab-")
+
+(defcustom noteworthy-collab-server-url "ws://localhost:8001/ws/emacs"
+  "Default WebSocket URL for the collaboration server."
+  :type 'string
+  :group 'noteworthy-collab)
+
+(defcustom noteworthy-collab-user-name (user-login-name)
+  "Display name for collaboration sessions."
+  :type 'string
+  :group 'noteworthy-collab)
+
+(defcustom noteworthy-collab-reconnect-delay 3
+  "Seconds to wait before attempting reconnection."
+  :type 'integer
+  :group 'noteworthy-collab)
+
+(defcustom noteworthy-collab-cursor-idle-time 0.1
+  "Seconds of idle time before sending cursor position."
+  :type 'number
+  :group 'noteworthy-collab)
+
+;;; ============================================================
+;;; Internal Variables
+;;; ============================================================
+
+(defvar noteworthy-collab--socket nil
+  "Active WebSocket connection.")
+
+(defvar noteworthy-collab--user-id nil
+  "Our user ID assigned by server.")
+
+(defvar noteworthy-collab--user-color nil
+  "Our cursor color assigned by server.")
+
+(defvar noteworthy-collab--project-root nil
+  "TRAMP path to current project root.")
+
+(defvar noteworthy-collab--server-url nil
+  "Current server URL.")
+
+(defvar noteworthy-collab--reconnect-timer nil
+  "Timer for reconnection attempts.")
+
+(defvar noteworthy-collab--cursor-timer nil
+  "Timer for debounced cursor updates.")
+
+(defvar-local noteworthy-collab--file-path nil
+  "Remote file path for this buffer (relative to project root).")
+
+(defvar-local noteworthy-collab--applying-remote nil
+  "Non-nil when applying remote changes (prevents echo).")
+
+(defvar-local noteworthy-collab--version 0
+  "Document version for this buffer.")
+
+(defvar-local noteworthy-collab--active nil
+  "Non-nil when this buffer is in collaborative mode.")
+
+(defvar noteworthy-collab--remote-cursors (make-hash-table :test 'equal)
+  "Hash-table mapping user-id -> (cursor-overlay . selection-overlay).")
+
+(defvar noteworthy-collab--remote-users (make-hash-table :test 'equal)
+  "Hash-table mapping user-id -> plist of :name :color :file :line :col.")
+
+(defvar noteworthy-collab--last-yjs-rejoin-at 0.0
+  "Last timestamp when we attempted Yjs tunnel recovery.")
+
+(defcustom noteworthy-collab-yjs-rejoin-cooldown 2.0
+  "Minimum seconds between automatic Yjs tunnel recovery attempts."
+  :type 'number
+  :group 'noteworthy-collab)
+
+;;; ============================================================
+;;; Log Buffer
+;;; ============================================================
+
+(defvar noteworthy-collab-log-buffer "*noteworthy-collab-log*"
+  "Name of the collaboration log buffer.")
+
+(defun noteworthy-collab--log (level fmt &rest args)
+  "Log message to the collab log buffer.
+LEVEL is a symbol like `info', `warn', `error'.
+FMT and ARGS are passed to `format'."
+  (let ((msg (apply #'format fmt args))
+        (timestamp (format-time-string "%H:%M:%S"))
+        (level-str (upcase (symbol-name level))))
+    (with-current-buffer (get-buffer-create noteworthy-collab-log-buffer)
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert (propertize 
+                 (format "[%s] " timestamp)
+                 'face 'font-lock-comment-face)
+                (propertize 
+                 (format "[%s] " level-str)
+                 'face (pcase level
+                         ('error 'error)
+                         ('warn 'warning)
+                         (_ 'font-lock-keyword-face)))
+                msg "\n"))
+      ;; Auto-scroll if visible
+      (when-let ((win (get-buffer-window (current-buffer))))
+        (with-selected-window win
+          (goto-char (point-max)))))))
+
+(defun noteworthy-collab-show-log ()
+  "Show the collaboration log buffer."
+  (interactive)
+  (display-buffer (get-buffer-create noteworthy-collab-log-buffer)))
+
+(defun noteworthy-collab-toggle-log ()
+  "Toggle between vterm and collab log buffer in the terminal window."
+  (interactive)
+  (let* ((log-buffer noteworthy-collab-log-buffer)
+         (vterm-buffer "*vterm*")
+         (target-window (cl-find-if
+                         (lambda (w)
+                           (let ((bname (buffer-name (window-buffer w))))
+                             (or (string= bname log-buffer)
+                                 (string= bname vterm-buffer)
+                                 (eq (buffer-local-value 'major-mode (window-buffer w))
+                                     'vterm-mode))))
+                         (window-list))))
+    (if target-window
+        (with-selected-window target-window
+          (if (string= (buffer-name) log-buffer)
+              (when (get-buffer vterm-buffer)
+                (switch-to-buffer vterm-buffer))
+            (switch-to-buffer (get-buffer-create log-buffer))))
+      (message "No terminal/log window found"))))
+
+;;; ============================================================
+;;; Chat Buffer
+;;; ============================================================
+
+(defvar noteworthy-collab-chat-buffer "*noteworthy-chat*"
+  "Name of the collaboration chat buffer.")
+
+(defun noteworthy-collab--display-chat (msg)
+  "Display chat message MSG in the chat buffer.
+MSG contains userId, name, color, message, timestamp."
+  (let* ((name (alist-get 'name msg))
+         (color (alist-get 'color msg))
+         (text (alist-get 'message msg))
+         (timestamp (format-time-string "%H:%M:%S" 
+                                        (seconds-to-time (/ (or (alist-get 'timestamp msg) 0) 1000))))
+         (buf (get-buffer-create noteworthy-collab-chat-buffer)))
+    
+    (with-current-buffer buf
+      (goto-char (point-max))
+      (let ((inhibit-read-only t))
+        (insert (propertize (format "[%s] " timestamp)
+                            'face 'font-lock-comment-face)
+                (propertize (format "<%s> " name)
+                            'face `(:foreground ,color :weight bold))
+                text "\n"))
+      ;; Auto-scroll if visible
+      (when-let ((win (get-buffer-window buf)))
+        (with-selected-window win
+          (goto-char (point-max)))))))
+
+(defun noteworthy-collab-send-chat (message)
+  "Send a chat MESSAGE to the server."
+  (interactive "sChat: ")
+  (when (not (string-empty-p message))
+    (noteworthy-collab--send
+     `((type . "chat")
+       (message . ,message)))))
+
+(defun noteworthy-collab-show-terminal ()
+  "Switch bottom window to vterm."
+  (interactive)
+  (noteworthy-collab--switch-bottom-buffer (get-buffer "*vterm*") 'vterm))
+
+(defun noteworthy-collab-show-debug ()
+  "Switch bottom window to debug log."
+  (interactive)
+  (noteworthy-collab--switch-bottom-buffer (get-buffer-create noteworthy-collab-log-buffer)))
+
+(defun noteworthy-collab-show-chat ()
+  "Switch bottom window to chat."
+  (interactive)
+  (noteworthy-collab--switch-bottom-buffer (get-buffer-create noteworthy-collab-chat-buffer)))
+
+(defun noteworthy-collab-show-typst-log ()
+  "Switch bottom window to typst log (compilation buffer)."
+  (interactive)
+  (let ((buf (or (get-buffer "*typst-ts-compilation*")
+                 (get-buffer "*typst-compilation*")
+                 (get-buffer "*noteworthy-output*")
+                 (get-buffer "*typst-ws-server*")))) ;; Added user's mentioned buffer
+    (if buf
+        (progn
+          (noteworthy-collab--switch-bottom-buffer buf)
+          (with-current-buffer buf
+            (goto-char (point-max))))
+      (message "No typst log buffer found. Searched for: *typst-ts-compilation*, *typst-compilation*, *noteworthy-output*, *typst-ws-server*"))))
+
+(defun noteworthy-collab--switch-bottom-buffer (buffer &optional mode-check)
+  "Switch the bottom window to BUFFER.
+If MODE-CHECK (symbol) is provided, it tries to find a window with that major-mode."
+  (let ((target-window (cl-find-if
+                        (lambda (w)
+                          (let ((b (window-buffer w)))
+                            (or (string= (buffer-name b) noteworthy-collab-log-buffer)
+                                (string= (buffer-name b) noteworthy-collab-chat-buffer)
+                                (string= (buffer-name b) "*vterm*")
+                                (with-current-buffer b
+                                  (or (eq major-mode 'vterm-mode)
+                                      (eq major-mode 'compilation-mode))))))
+                        (window-list))))
+    (if target-window
+        (with-selected-window target-window
+          (when buffer (switch-to-buffer buffer)))
+      ;; If not found, split editor window
+      (when buffer
+        (when-let ((editor-win (cl-find-if (lambda (w) (window-parameter w 'noteworthy-editor)) (window-list))))
+          (select-window editor-win)
+          (let ((new-win (split-window-below (floor (* 0.75 (window-height))))))
+            (select-window new-win)
+            (switch-to-buffer buffer)))))))
+
+;;; ============================================================
+;;; WebSocket Connection
+;;; ============================================================
+
+(defun noteworthy-collab--connect (url)
+  "Connect to collaboration server at URL."
+  (when noteworthy-collab--socket
+    (websocket-close noteworthy-collab--socket)
+    (setq noteworthy-collab--socket nil))
+  
+  (when noteworthy-collab--reconnect-timer
+    (cancel-timer noteworthy-collab--reconnect-timer)
+    (setq noteworthy-collab--reconnect-timer nil))
+  
+  (setq noteworthy-collab--server-url url)
+  (noteworthy-collab--log 'info "Connecting to %s..." url)
+  
+  (condition-case err
+      (setq noteworthy-collab--socket
+            (websocket-open
+             (format "%s?name=%s" url (url-hexify-string noteworthy-collab-user-name))
+             :on-open #'noteworthy-collab--on-open
+             :on-message #'noteworthy-collab--on-message
+             :on-close #'noteworthy-collab--on-close
+             :on-error #'noteworthy-collab--on-error))
+    (error
+     (noteworthy-collab--log 'error "Connection failed: %s" (error-message-string err))
+     (noteworthy-collab--schedule-reconnect))))
+
+(defun noteworthy-collab--on-open (_ws)
+  "Handle WebSocket open."
+  (noteworthy-collab--log 'info "Connected to server")
+  ;; Infer preview URL from server address (default tinymist port 23625)
+  (when noteworthy-collab--server-url
+    (noteworthy-collab--infer-preview-url noteworthy-collab--server-url)))
+
+(defun noteworthy-collab--on-close (_ws)
+  "Handle WebSocket close."
+  (noteworthy-collab--log 'warn "Disconnected from server")
+  (setq noteworthy-collab--socket nil)
+  (noteworthy-collab--schedule-reconnect))
+
+(defun noteworthy-collab--on-error (_ws _type err)
+  "Handle WebSocket error."
+  (noteworthy-collab--log 'error "WebSocket error: %s" err))
+
+(defun noteworthy-collab--on-message (_ws frame)
+  "Handle incoming WebSocket message."
+  (condition-case err
+      (let* ((payload (websocket-frame-text frame))
+             (msg (json-parse-string payload :object-type 'alist)))
+        (noteworthy-collab--log 'info "RECV raw: %s" payload)
+        (noteworthy-collab--handle-message msg))
+    (error
+     (noteworthy-collab--log 'error "Message parse error: %s" (error-message-string err)))))
+
+(defun noteworthy-collab--schedule-reconnect ()
+  "Schedule a reconnection attempt."
+  (when (and noteworthy-collab--server-url
+             (not noteworthy-collab--reconnect-timer))
+    (noteworthy-collab--log 'info "Reconnecting in %d seconds..." noteworthy-collab-reconnect-delay)
+    (setq noteworthy-collab--reconnect-timer
+          (run-with-timer noteworthy-collab-reconnect-delay nil
+                          (lambda ()
+                            (setq noteworthy-collab--reconnect-timer nil)
+                            (when noteworthy-collab--server-url
+                              (noteworthy-collab--connect noteworthy-collab--server-url)))))))
+
+(defun noteworthy-collab--send (msg)
+  "Send MSG (alist) to server as JSON."
+  (if (not noteworthy-collab--socket)
+      (noteworthy-collab--log 'error "SEND failed: No socket")
+    (if (not (websocket-openp noteworthy-collab--socket))
+        (noteworthy-collab--log 'error "SEND failed: Socket not open")
+      (let ((json-str (json-encode msg)))
+        (noteworthy-collab--log 'info "SEND raw: %s" json-str)
+        (websocket-send-text noteworthy-collab--socket json-str)))))
+
+(defun noteworthy-collab-connected-p ()
+  "Return non-nil if connected to server."
+  (and noteworthy-collab--socket
+       (websocket-openp noteworthy-collab--socket)))
+
+;;; ============================================================
+;;; Message Handling
+;;; ============================================================
+
+(defun noteworthy-collab--handle-message (msg)
+  "Handle parsed message MSG from server."
+  (let ((type (alist-get 'type msg)))
+    (pcase type
+      ("welcome"
+       (setq noteworthy-collab--user-id (alist-get 'userId msg))
+       (setq noteworthy-collab--user-color (alist-get 'color msg))
+       (noteworthy-collab--update-user-cache-from-list (alist-get 'users msg))
+       (noteworthy-collab--log 'info "Joined as %s (color: %s)"
+                               noteworthy-collab--user-id
+                               noteworthy-collab--user-color)
+       ;; Rejoin current file if any
+       (dolist (buf (buffer-list))
+         (with-current-buffer buf
+           (when (and noteworthy-collab--active noteworthy-collab--file-path)
+             (noteworthy-collab--join-file-internal noteworthy-collab--file-path)))))
+      
+      ("sync"
+       (noteworthy-collab--apply-sync msg))
+      
+      ("delta"
+       (noteworthy-collab--apply-delta msg))
+      
+      ("cursor"
+       (noteworthy-collab--show-cursor msg))
+
+      ("user_joined"
+       (noteworthy-collab--handle-user-presence msg))
+
+      ("user_updated"
+       (noteworthy-collab--handle-user-presence msg))
+
+      ("user_left"
+       (noteworthy-collab--handle-user-presence msg))
+      
+      ("users"
+       (noteworthy-collab--update-users msg))
+      
+      ("chat"
+       (noteworthy-collab--display-chat msg))
+
+      ("saved"
+       (noteworthy-collab--log 'info "Saved: %s (v%s)"
+                               (alist-get 'file msg)
+                               (alist-get 'version msg)))
+      
+      ("log"
+       (let ((message (alist-get 'message msg)))
+         (noteworthy-collab--log
+          (intern (or (alist-get 'level msg) "info"))
+          "[Server] %s" message)
+         (noteworthy-collab--maybe-recover-yjs-tunnel message))))))
+
+(defun noteworthy-collab--rejoin-active-files (&optional reason)
+  "Rejoin all active file sessions.
+REASON is an optional log message describing why rejoin was triggered."
+  (when (noteworthy-collab-connected-p)
+    (let ((joined 0)
+          (seen (make-hash-table :test 'equal)))
+      (dolist (buf (buffer-list))
+        (with-current-buffer buf
+          (when (and noteworthy-collab--active
+                     noteworthy-collab--file-path
+                     (not (gethash noteworthy-collab--file-path seen)))
+            (puthash noteworthy-collab--file-path t seen)
+            (setq joined (1+ joined))
+            (noteworthy-collab--join-file-internal noteworthy-collab--file-path))))
+      (when (> joined 0)
+        (noteworthy-collab--log
+         'warn
+         "Triggered file rejoin (%s): %d active file(s)"
+         (or reason "manual")
+         joined)))))
+
+(defun noteworthy-collab--maybe-recover-yjs-tunnel (message)
+  "Detect Yjs tunnel failures in MESSAGE and recover by rejoining files."
+  (when (and (stringp message)
+             (string-match-p "Failed to forward delta to Yjs" message))
+    (let ((now (float-time)))
+      (when (>= (- now noteworthy-collab--last-yjs-rejoin-at)
+                noteworthy-collab-yjs-rejoin-cooldown)
+        (setq noteworthy-collab--last-yjs-rejoin-at now)
+        (noteworthy-collab--rejoin-active-files "bridge Yjs forward failure")))))
+
+(defun noteworthy-collab--listify (value)
+  "Return VALUE as a list.
+Vectors are converted to lists; other non-list values return nil."
+  (cond
+   ((vectorp value) (append value nil))
+   ((listp value) value)
+   (t nil)))
+
+(defun noteworthy-collab--safe-int (value default)
+  "Return VALUE as an integer, falling back to DEFAULT."
+  (cond
+   ((integerp value) value)
+   ((numberp value) (truncate value))
+   ((and (stringp value)
+         (string-match-p "\\`-?[0-9]+\\'" value))
+    (string-to-number value))
+   (t default)))
+
+(defun noteworthy-collab--user-id-from-packet (msg)
+  "Extract a user id from MSG."
+  (or (alist-get 'userId msg)
+      (alist-get 'id msg)
+      (alist-get 'clientId msg)))
+
+(defun noteworthy-collab--point-from-line-col (line col)
+  "Translate 1-based LINE and 0-based COL to a point."
+  (save-excursion
+    (goto-char (point-min))
+    (forward-line (max 0 (1- (noteworthy-collab--safe-int line 1))))
+    (move-to-column (max 0 (noteworthy-collab--safe-int col 0)))
+    (point)))
+
+(defun noteworthy-collab--normalize-range (start end)
+  "Clamp START and END to buffer bounds and return (START . END)."
+  (let* ((min-pos (point-min))
+         (max-pos (point-max))
+         (clamped-start (max min-pos (min max-pos start)))
+         (clamped-end (max min-pos (min max-pos end))))
+    (if (> clamped-start clamped-end)
+        (cons clamped-end clamped-start)
+      (cons clamped-start clamped-end))))
+
+(defun noteworthy-collab--selection-range-from-cursor (msg)
+  "Extract selection range from cursor MSG as a point pair."
+  (let* ((legacy-start (alist-get 'selStart msg))
+         (legacy-end (alist-get 'selEnd msg))
+         (start-line (or (alist-get 'selStartLine msg)
+                         (and (listp legacy-start)
+                              (alist-get 'line legacy-start))))
+         (start-col (or (alist-get 'selStartCol msg)
+                        (and (listp legacy-start)
+                             (or (alist-get 'col legacy-start)
+                                 (alist-get 'column legacy-start)))
+                        0))
+         (end-line (or (alist-get 'selEndLine msg)
+                       (and (listp legacy-end)
+                            (alist-get 'line legacy-end))))
+         (end-col (or (alist-get 'selEndCol msg)
+                      (and (listp legacy-end)
+                           (or (alist-get 'col legacy-end)
+                               (alist-get 'column legacy-end)))
+                      0)))
+    (cond
+     ((and start-line end-line)
+      (let* ((start-pos (noteworthy-collab--point-from-line-col start-line start-col))
+             (end-pos (noteworthy-collab--point-from-line-col end-line end-col))
+             (range (noteworthy-collab--normalize-range start-pos end-pos)))
+        (when (/= (car range) (cdr range))
+          range)))
+     ((and (numberp legacy-start) (numberp legacy-end))
+      (let ((range (noteworthy-collab--normalize-range legacy-start legacy-end)))
+        (when (/= (car range) (cdr range))
+          range))))))
+
+(defun noteworthy-collab--line-col-at-pos (pos)
+  "Return (LINE . COL) at POS."
+  (save-excursion
+    (goto-char pos)
+    (cons (line-number-at-pos) (current-column))))
+
+(defun noteworthy-collab--store-remote-user (msg)
+  "Store user identity and position fields from MSG."
+  (let* ((user-id (noteworthy-collab--user-id-from-packet msg))
+         (name (or (alist-get 'name msg) "unknown"))
+         (color (or (alist-get 'color msg) "#FF00FF"))
+         (file (alist-get 'file msg))
+         (line (noteworthy-collab--safe-int (alist-get 'line msg) 1))
+         (col (noteworthy-collab--safe-int
+               (or (alist-get 'col msg) (alist-get 'column msg))
+               0)))
+    (when user-id
+      (puthash user-id
+               (list :name name :color color :file file :line line :col col)
+               noteworthy-collab--remote-users))))
+
+(defun noteworthy-collab--update-user-cache-from-list (users)
+  "Merge USERS into `noteworthy-collab--remote-users'."
+  (dolist (user (noteworthy-collab--listify users))
+    (noteworthy-collab--store-remote-user user)))
+
+(defun noteworthy-collab--handle-user-presence (msg)
+  "Handle presence packet MSG (`user_joined`, `user_updated`, `user_left`)."
+  (let* ((event (alist-get 'type msg))
+         (payload (or (alist-get 'user msg) msg))
+         (user-id (noteworthy-collab--user-id-from-packet payload)))
+    (pcase event
+      ("user_left"
+       (when user-id
+         (noteworthy-collab--clear-cursor-overlays user-id)
+         (remhash user-id noteworthy-collab--remote-users))
+       (noteworthy-collab--log 'info "Presence: user_left %s" (or user-id "unknown")))
+      (_
+       (noteworthy-collab--store-remote-user payload)
+       (noteworthy-collab--log
+        'info
+        "Presence: %s %s"
+        event
+        (or (alist-get 'name payload) user-id "unknown"))))))
+
+(defun noteworthy-collab--find-buffer-for-file (file-path)
+  "Find buffer that is editing FILE-PATH."
+  (cl-find-if (lambda (buf)
+                (with-current-buffer buf
+                  (and noteworthy-collab--file-path
+                       (string= noteworthy-collab--file-path file-path))))
+              (buffer-list)))
+
+(defun noteworthy-collab--apply-sync (msg)
+  "Apply full sync from server."
+  (let* ((file (alist-get 'file msg))
+         (content (alist-get 'content msg))
+         (version (alist-get 'version msg))
+         (buf (noteworthy-collab--find-buffer-for-file file)))
+    (when buf
+      (with-current-buffer buf
+        (let ((noteworthy-collab--applying-remote t)
+              (inhibit-modification-hooks t)
+              (pos (point)))
+          (erase-buffer)
+          (insert content)
+          (setq noteworthy-collab--version version)
+          ;; Try to restore position
+          (goto-char (min pos (point-max))))
+        (noteworthy-collab--log 'info "Synced %s (v%s, %d chars)" 
+                                file version (length content))))))
+
+(defun noteworthy-collab--apply-delta (msg)
+  "Apply delta from remote user."
+  (let* ((file (alist-get 'file msg))
+         (ops (alist-get 'ops msg))
+         (user-id (alist-get 'userId msg))
+         (buf (noteworthy-collab--find-buffer-for-file file)))
+    ;; Don't apply our own deltas (server echoes them back)
+    (when (and buf 
+               (not (and user-id
+                         noteworthy-collab--user-id
+                         (string= user-id noteworthy-collab--user-id))))
+      (with-current-buffer buf
+        (let ((noteworthy-collab--applying-remote t)
+              (inhibit-modification-hooks t))
+          (noteworthy-collab--apply-ops ops)
+          ;; Force syntax highlighting refresh after remote edit
+          (font-lock-flush)
+          ;; Update treesit if available
+          (when (and (fboundp 'treesit-parser-list)
+                     (treesit-parser-list))
+            (treesit-update-ranges)))))))
+
+(defun noteworthy-collab--apply-ops (ops)
+  "Apply delta OPS to current buffer with bounds checking.
+OPS is a vector/list of operations like:
+  [{\"retain\": 10}, {\"insert\": \"hello\"}, {\"delete\": 5}]"
+  (save-excursion
+    (goto-char (point-min))
+    (let ((ops-list (if (vectorp ops) (append ops nil) ops)))
+      (dolist (op ops-list)
+        (condition-case err
+            (cond
+             ((alist-get 'retain op)
+              (let ((count (alist-get 'retain op))
+                    (remaining (- (point-max) (point))))
+                ;; Clamp retain to remaining buffer
+                (forward-char (min count remaining))))
+             ((alist-get 'insert op)
+              (insert (alist-get 'insert op)))
+             ((alist-get 'delete op)
+              (let ((count (alist-get 'delete op))
+                    (remaining (- (point-max) (point))))
+                ;; Clamp delete to remaining buffer
+                (delete-char (min count remaining)))))
+          (error
+           (noteworthy-collab--log 'warn "Op error: %s (op: %s)" err op)))))))
+
+(defun noteworthy-collab--show-cursor (msg)
+  "Show remote user's cursor and selection.
+MSG accepts both legacy and canonical selection fields."
+  (let* ((user-id (noteworthy-collab--user-id-from-packet msg))
+         (name (alist-get 'name msg))
+         (color (alist-get 'color msg))
+         (file (alist-get 'file msg))
+         (line (noteworthy-collab--safe-int (alist-get 'line msg) 1))
+         (col (noteworthy-collab--safe-int
+               (or (alist-get 'col msg) (alist-get 'column msg))
+               0))
+         ;; If file is nil, use current buffer's file OR look up from remote-users
+         (effective-file (or file 
+                              noteworthy-collab--file-path
+                              (plist-get (gethash user-id noteworthy-collab--remote-users) :file)))
+         (buf (if effective-file
+                  (noteworthy-collab--find-buffer-for-file effective-file)
+                (current-buffer))))
+    (when (and user-id
+               (not (and noteworthy-collab--user-id
+                         (string= user-id noteworthy-collab--user-id))))
+      ;; Ensure color has a value
+      (unless color (setq color "#FF00FF"))
+      (unless name (setq name "unknown"))
+
+      ;; Store user info for tracking
+      (puthash user-id
+               (list :name name :color color :file effective-file
+                     :line line :col col)
+               noteworthy-collab--remote-users)
+
+      (when buf
+        (with-current-buffer buf
+          ;; Clean up old overlays for this user
+          (noteworthy-collab--clear-cursor-overlays user-id)
+
+          (let* ((cursor-pos (noteworthy-collab--point-from-line-col line col))
+                 (selection-range (noteworthy-collab--selection-range-from-cursor msg))
+                 (cursor-ov nil)
+                 (sel-ov nil))
+            ;; Create cursor overlay covering 1 character (like crdt.el)
+            (setq cursor-ov (make-overlay cursor-pos (min (1+ cursor-pos) (point-max))))
+            (overlay-put cursor-ov 'noteworthy-cursor t)
+            (overlay-put cursor-ov 'noteworthy-user user-id)
+            (overlay-put cursor-ov 'priority 100)
+
+            ;; Just highlight the character - no name label (doesn't push text)
+            (overlay-put cursor-ov 'face
+                         `(:background ,color
+                                       :foreground ,(face-attribute 'default :background nil 'default)))
+
+            ;; Show name on hover only
+            (overlay-put cursor-ov 'help-echo (format "%s" name))
+
+            ;; Store user info for proximity-based name display
+            (overlay-put cursor-ov 'noteworthy-name name)
+            (overlay-put cursor-ov 'noteworthy-color color)
+
+            ;; Create selection overlay when range is available
+            (when selection-range
+              (setq sel-ov (make-overlay (car selection-range) (cdr selection-range)))
+              (overlay-put sel-ov 'noteworthy-selection t)
+              (overlay-put sel-ov 'noteworthy-user user-id)
+              (overlay-put sel-ov 'face `(:background ,(noteworthy-collab--fade-color color 0.3)))
+              (overlay-put sel-ov 'priority 50))
+
+            ;; Store overlays for cleanup
+            (puthash user-id (cons cursor-ov sel-ov) noteworthy-collab--remote-cursors)))))))
+
+(defun noteworthy-collab--fade-color (hex-color opacity)
+  "Create a faded version of HEX-COLOR with OPACITY (0.0-1.0)."
+  (if (and hex-color (string-prefix-p "#" hex-color))
+      (let* ((r (string-to-number (substring hex-color 1 3) 16))
+             (g (string-to-number (substring hex-color 3 5) 16))
+             (b (string-to-number (substring hex-color 5 7) 16))
+             ;; Blend with background (assume dark: #1a1a1a)
+             (bg-r 26) (bg-g 26) (bg-b 26)
+             (mix-r (round (+ (* r opacity) (* bg-r (- 1 opacity)))))
+             (mix-g (round (+ (* g opacity) (* bg-g (- 1 opacity)))))
+             (mix-b (round (+ (* b opacity) (* bg-b (- 1 opacity))))))
+        (format "#%02x%02x%02x" mix-r mix-g mix-b))
+    "#333333"))
+
+(defun noteworthy-collab--clear-cursor-overlays (user-id)
+  "Remove cursor and selection overlays for USER-ID."
+  (when-let ((overlays (gethash user-id noteworthy-collab--remote-cursors)))
+    (when (car overlays) (delete-overlay (car overlays)))
+    (when (cdr overlays) (delete-overlay (cdr overlays)))
+    (remhash user-id noteworthy-collab--remote-cursors)))
+
+(defun noteworthy-collab--update-users (msg)
+  "Handle users list update."
+  (let* ((file (alist-get 'file msg))
+         (users-list (noteworthy-collab--listify (alist-get 'users msg))))
+    (noteworthy-collab--update-user-cache-from-list users-list)
+    (noteworthy-collab--log 'info "Users in %s: %s"
+                            file
+                            (mapconcat (lambda (u) (or (alist-get 'name u) "unknown"))
+                                       users-list
+                                       ", "))))
+
+;;; ============================================================
+;;; Local Change Tracking
+;;; ============================================================
+
+(defvar-local noteworthy-collab--saved-auto-save nil
+  "Saved buffer-auto-save-file-name before collab was enabled.")
+
+(defvar noteworthy-collab--global-auto-save-disabled nil
+  "Whether we've disabled global auto-save features.")
+
+(defun noteworthy-collab--disable-global-auto-save ()
+  "Disable all global auto-save mechanisms."
+  (unless noteworthy-collab--global-auto-save-disabled
+    (setq noteworthy-collab--global-auto-save-disabled t)
+    
+    ;; Disable auto-save-visited-mode if active
+    (when (bound-and-true-p auto-save-visited-mode)
+      (auto-save-visited-mode -1)
+      (noteworthy-collab--log 'info "Disabled auto-save-visited-mode"))
+    
+    ;; Disable super-save-mode if active (common in Doom)
+    (when (bound-and-true-p super-save-mode)
+      (super-save-mode -1)
+      (noteworthy-collab--log 'info "Disabled super-save-mode"))
+    
+    ;; Disable ws-butler auto-trim (can trigger saves)
+    (when (bound-and-true-p ws-butler-global-mode)
+      (ws-butler-global-mode -1)
+      (noteworthy-collab--log 'info "Disabled ws-butler-global-mode"))
+    
+    ;; Remove save hooks that might auto-trigger
+    (remove-hook 'focus-out-hook #'save-some-buffers)
+    (remove-hook 'focus-out-hook #'doom-auto-save-non-file-buffers-h)
+    
+    (noteworthy-collab--log 'info "Global auto-save features disabled")))
+
+(defun noteworthy-collab--setup-buffer ()
+  "Setup collaboration for current buffer."
+  (noteworthy-collab--log 'info "Setting up buffer: %s" (buffer-name))
+  (setq noteworthy-collab--active t)
+  
+  ;; Disable global auto-save on first buffer setup
+  (noteworthy-collab--disable-global-auto-save)
+  
+  ;; Disable buffer-local auto-save
+  (setq noteworthy-collab--saved-auto-save buffer-auto-save-file-name)
+  (setq buffer-auto-save-file-name nil)
+  
+  ;; Disable ws-butler for this buffer
+  (when (bound-and-true-p ws-butler-mode)
+    (ws-butler-mode -1))
+  
+  ;; Activate noteworthy-typst-mode for .typ files (triggers keybinding hooks)
+  (when (and noteworthy-collab--file-path 
+             (string-suffix-p ".typ" noteworthy-collab--file-path))
+    (when (fboundp 'noteworthy-typst-mode)
+      (noteworthy-typst-mode 1)))
+  
+  (noteworthy-collab--log 'info "Disabled auto-save for: %s" (buffer-name))
+  
+  ;; Install hooks
+  (add-hook 'after-change-functions #'noteworthy-collab--after-change nil t)
+  (add-hook 'post-command-hook #'noteworthy-collab--post-command nil t)
+  (add-hook 'kill-buffer-hook #'noteworthy-collab--on-kill nil t)
+  (noteworthy-collab--log 'info "Hooks installed for: %s (after-change-functions has %d items)" 
+                          (buffer-name)
+                          (length after-change-functions)))
+
+(defun noteworthy-collab--teardown-buffer ()
+  "Remove collaboration from current buffer."
+  (setq noteworthy-collab--active nil)
+  
+  ;; Restore auto-save if it was enabled before
+  (when noteworthy-collab--saved-auto-save
+    (setq buffer-auto-save-file-name noteworthy-collab--saved-auto-save)
+    (noteworthy-collab--log 'info "Restored auto-save for: %s" (buffer-name)))
+  
+  ;; Remove hooks
+  (remove-hook 'after-change-functions #'noteworthy-collab--after-change t)
+  (remove-hook 'post-command-hook #'noteworthy-collab--post-command t)
+  (remove-hook 'kill-buffer-hook #'noteworthy-collab--on-kill t))
+
+(defun noteworthy-collab--after-change (beg end len)
+  "Hook for after-change-functions. Send delta to server.
+BEG and END are buffer positions after change.
+LEN is length of deleted text."
+  ;; Always log that we were called (for debugging)
+  (noteworthy-collab--log 'info "after-change CALLED: beg=%d end=%d len=%d applying-remote=%s file-path=%s"
+                          beg end len noteworthy-collab--applying-remote noteworthy-collab--file-path)
+  ;; Use condition-case to prevent errors from propagating to other hooks
+  (condition-case err
+      (unless noteworthy-collab--applying-remote
+        (if (not noteworthy-collab--file-path)
+            (noteworthy-collab--log 'info "after-change: No file-path set (buffer: %s)" (buffer-name))
+          (if (not (noteworthy-collab-connected-p))
+              (noteworthy-collab--log 'info "after-change: Not connected")
+            (let ((inserted (buffer-substring-no-properties beg end))
+                  (ops '()))
+              ;; Build delta ops (0-indexed positions)
+              ;; Each op must be an alist for proper JSON encoding
+              (when (> (1- beg) 0)
+                (push `((retain . ,(1- beg))) ops))
+              (when (> len 0)
+                (push `((delete . ,len)) ops))
+              (when (> (length inserted) 0)
+                (push `((insert . ,inserted)) ops))
+              ;; Send to server
+              (if ops
+                  (let ((final-ops (vconcat (nreverse ops))))
+                    (noteworthy-collab--log 'info "SEND delta: file=%s beg=%d end=%d len=%d ops=%s" 
+                                            noteworthy-collab--file-path beg end len final-ops)
+                    (noteworthy-collab--send
+                     `((type . "delta")
+                       (file . ,noteworthy-collab--file-path)
+                       (ops . ,final-ops))))
+                (noteworthy-collab--log 'info "after-change: No ops generated (inserted='%s')" inserted))))))
+    (error
+     (noteworthy-collab--log 'error "after-change error: %s" (error-message-string err)))))
+
+(defun noteworthy-collab--post-command ()
+  "Post-command hook for cursor sending and remote cursor name display."
+  (when noteworthy-collab--active
+    ;; Debounce cursor updates
+    (when noteworthy-collab--cursor-timer
+      (cancel-timer noteworthy-collab--cursor-timer))
+    (setq noteworthy-collab--cursor-timer
+          (run-with-idle-timer noteworthy-collab-cursor-idle-time nil
+                               #'noteworthy-collab--send-cursor))
+    ;; Check if we're on a remote cursor and show name
+    (let ((name nil))
+      (dolist (ov (overlays-at (point)))
+        (when (and (overlay-get ov 'noteworthy-cursor)
+                   (not name))
+          (setq name (overlay-get ov 'noteworthy-name))))
+      (when name
+        (message "%s" name)))))
+
+(defun noteworthy-collab--send-cursor ()
+  "Send cursor position (and active selection) to server."
+  (when (and noteworthy-collab--file-path
+             (noteworthy-collab-connected-p))
+    (let ((msg `((type . "cursor")
+                 (file . ,noteworthy-collab--file-path)
+                 (line . ,(line-number-at-pos))
+                 (col . ,(current-column)))))
+      ;; Add selection info in canonical line/column fields.
+      ;; Keep legacy object shape for bridge compatibility during transition.
+      (when (region-active-p)
+        (let* ((start (noteworthy-collab--line-col-at-pos (region-beginning)))
+               (end (noteworthy-collab--line-col-at-pos (region-end))))
+          (setq msg
+                (append
+                 msg
+                 `((selStartLine . ,(car start))
+                   (selStartCol . ,(cdr start))
+                   (selEndLine . ,(car end))
+                   (selEndCol . ,(cdr end))
+                   (selStart . ((line . ,(car start))
+                                (col . ,(cdr start))))
+                   (selEnd . ((line . ,(car end))
+                              (col . ,(cdr end)))))))))
+      (noteworthy-collab--send msg))))
+
+(defun noteworthy-collab--on-kill ()
+  "Hook for kill-buffer. Leave file session."
+  (when noteworthy-collab--file-path
+    (noteworthy-collab-leave-file)))
+
+;;; ============================================================
+;;; File Session Management
+;;; ============================================================
+
+(defun noteworthy-collab--join-file-internal (file-path)
+  "Internal: Send join message for FILE-PATH."
+  (noteworthy-collab--send
+   `((type . "join")
+     (file . ,file-path))))
+
+(defun noteworthy-collab-join-file (file-path)
+  "Join collaboration session for FILE-PATH."
+  (noteworthy-collab--log 'info "join-file called: %s (buffer: %s)" file-path (buffer-name))
+  (setq-local noteworthy-collab--file-path file-path)
+  (noteworthy-collab--log 'info "Set buffer-local file-path to: %s" noteworthy-collab--file-path)
+  (noteworthy-collab--setup-buffer)
+  (when (noteworthy-collab-connected-p)
+    (noteworthy-collab--join-file-internal file-path))
+  (noteworthy-collab--log 'info "Joined: %s" file-path))
+
+(defun noteworthy-collab-leave-file ()
+  "Leave current file's collaboration session."
+  (when noteworthy-collab--file-path
+    (when (noteworthy-collab-connected-p)
+      (noteworthy-collab--send
+       `((type . "leave")
+         (file . ,noteworthy-collab--file-path))))
+    (noteworthy-collab--log 'info "Left: %s" noteworthy-collab--file-path)
+    (noteworthy-collab--teardown-buffer)
+    (setq-local noteworthy-collab--file-path nil)))
+
+;;; ============================================================
+;;; Project File Detection
+;;; ============================================================
+
+(defun noteworthy-collab--is-project-file-p (file-path)
+  "Return non-nil if FILE-PATH is within the project."
+  (and noteworthy-collab--project-root
+       (string-prefix-p (file-truename noteworthy-collab--project-root)
+                        (file-truename file-path))))
+
+(defun noteworthy-collab--relative-path (file-path)
+  "Get FILE-PATH relative to project root."
+  (if noteworthy-collab--project-root
+      (file-relative-name file-path noteworthy-collab--project-root)
+    file-path))
+
+(defun noteworthy-collab--on-find-file ()
+  "Hook for find-file. Auto-join CRDT session for project files."
+  (noteworthy-collab--log 'info "on-find-file hook: %s" (buffer-file-name))
+  (when-let ((file (buffer-file-name)))
+    (noteworthy-collab--log 'info "  project-root: %s" noteworthy-collab--project-root)
+    (noteworthy-collab--log 'info "  is-project-file?: %s" (noteworthy-collab--is-project-file-p file))
+    (noteworthy-collab--log 'info "  is-typ?: %s" (string-suffix-p ".typ" file))
+    (when (and noteworthy-collab--project-root
+               (noteworthy-collab--is-project-file-p file)
+               (string-suffix-p ".typ" file))
+      (let ((rel-path (noteworthy-collab--relative-path file)))
+        (noteworthy-collab--log 'info "  rel-path: %s" rel-path)
+        (noteworthy-collab-join-file rel-path)))))
+
+;;; ============================================================
+;;; Server Status & Preview Discovery
+;;; ============================================================
+
+(defun noteworthy-collab--fetch-server-status (http-url callback)
+  "Fetch server status from HTTP-URL/api/status and call CALLBACK with result."
+  (let ((url (concat http-url "/api/status")))
+    (url-retrieve
+     url
+     (lambda (_status)
+       (goto-char (point-min))
+       (when (re-search-forward "\n\n" nil t)
+         (condition-case nil
+             (let ((json-data (json-parse-buffer :object-type 'alist)))
+               (funcall callback json-data))
+           (error (funcall callback nil)))))
+     nil t t)))
+
+
+
+(defun noteworthy-collab--infer-preview-url (ws-url)
+  "Infer preview URL from WS-URL.
+Assumes tinymist is running on port 23625 on the same host."
+  (let* ((host (if (string-match "ws://\\([^/:]+\\)" ws-url)
+                   (match-string 1 ws-url)
+                 "localhost"))
+         (preview-url (format "http://%s:23625" host)))
+    (setq noteworthy-collab-preview-url preview-url)
+    (noteworthy-collab--log 'info "Inferred preview URL: %s" preview-url)
+    ;; Refresh preview if window exists
+    (noteworthy-collab-refresh-preview)))
+
+(defun noteworthy-collab--ws-to-http (ws-url)
+  "Convert WebSocket URL to HTTP URL.
+ws://host:port/path -> http://host:port"
+  (save-match-data
+    (if (string-match "^wss?://\\([^/]+\\)" ws-url)
+        (let ((host-port (match-string 1 ws-url)))
+          (if (string-prefix-p "wss://" ws-url)
+              (concat "https://" host-port)
+            (concat "http://" host-port)))
+      ws-url)))
+
+(defun noteworthy-collab--bridge-http-fallback-url (http-url)
+  "Map bridge HTTP-URL on :8001 to main server URL on :8000."
+  (save-match-data
+    (when (string-match "^\\(https?://[^/:]+\\):8001\\'" http-url)
+      (concat (match-string 1 http-url) ":8000"))))
+
+;;; ============================================================
+;;; Main Entry Points
+;;; ============================================================
+
+;;;###autoload
+(defun noteworthy-remote-init (server-url tramp-path &optional pdf-path)
+  "Initialize Noteworthy remote collaborative session.
+
+SERVER-URL: WebSocket URL (e.g., ws://server:8001/ws/emacs)
+TRAMP-PATH: TRAMP path to project (e.g., /ssh:server:/path/to/project)
+            For localhost, use regular path like ~/Typst/project
+PDF-PATH: Optional PDF file to display (can be TRAMP path)
+
+This sets up:
+- WebSocket connection to the collaboration server
+- Treemacs with the project
+- Auto-join CRDT sessions when opening .typ files
+- Tinymist live preview (auto-discovered from server)
+- Optional PDF viewer window"
+  (interactive
+   (let* ((url (read-string "Server URL: " noteworthy-collab-server-url))
+          (project (read-directory-name "Project: " "~/"))
+          (pdf (read-file-name "PDF file (optional, RET to skip): " project nil nil)))
+     (list url project (if (string-empty-p pdf) nil pdf))))
+  
+  ;; Store project root
+  (setq noteworthy-collab--project-root (file-truename tramp-path))
+  
+  ;; Connect to server
+  (noteworthy-collab--connect server-url)
+  
+  ;; Setup find-file hook
+  (add-hook 'find-file-hook #'noteworthy-collab--on-find-file)
+  
+  ;; Fetch server status to discover tinymist preview URL
+  (let* ((status-url (noteworthy-collab--ws-to-http server-url))
+         (fallback-status-url (noteworthy-collab--bridge-http-fallback-url status-url))
+         (apply-status
+          (lambda (status)
+            (let* ((tinymist (alist-get 'tinymist status))
+                   (running (alist-get 'running tinymist))
+                   (preview-url (alist-get 'url tinymist)))
+              (if (and running preview-url)
+                  (progn
+                    (noteworthy-collab--log 'info "Tinymist preview at: %s" preview-url)
+                    (require 'noteworthy-collab-layout)
+                    (setq noteworthy-collab-preview-url preview-url)
+                    ;; Force refresh of placeholder with actual URL
+                    (noteworthy-collab-refresh-preview))
+                (noteworthy-collab--log 'warn "Tinymist preview not available"))))))
+    (noteworthy-collab--log 'info "Querying server status: %s" status-url)
+    (noteworthy-collab--fetch-server-status
+     status-url
+     (lambda (status)
+       (if status
+           (funcall apply-status status)
+         (if fallback-status-url
+             (progn
+               (noteworthy-collab--log
+                'info
+                "Status not found on bridge, retrying: %s"
+                fallback-status-url)
+               (noteworthy-collab--fetch-server-status
+                fallback-status-url
+                (lambda (fallback-status)
+                  (if fallback-status
+                      (funcall apply-status fallback-status)
+                    (noteworthy-collab--log 'warn "Tinymist preview not available")))))
+           (noteworthy-collab--log 'warn "Tinymist preview not available"))))))
+  
+  ;; Initialize layout (will use preview URL if set)
+  (run-with-timer 
+   0.5 nil  ; Small delay to let status fetch complete
+   (lambda ()
+     (require 'noteworthy-collab-layout)
+     (noteworthy-collab-layout-init tramp-path pdf-path)
+     ;; Join CRDT for all already-open .typ files in the project
+     (noteworthy-collab--join-open-buffers)
+     (noteworthy-collab--log 'info "Initialized session: %s" tramp-path))))
+
+(defun noteworthy-collab--join-open-buffers ()
+  "Join CRDT session for all open .typ files in the project."
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when-let ((file (buffer-file-name)))
+        (when (and (string-suffix-p ".typ" file)
+                   (noteworthy-collab--is-project-file-p file)
+                   (not noteworthy-collab--active))
+          (let ((rel-path (noteworthy-collab--relative-path file)))
+            (noteworthy-collab--log 'info "Auto-joining already-open buffer: %s" rel-path)
+            (noteworthy-collab-join-file rel-path)))))))
+
+;;;###autoload
+(defun noteworthy-collab-disconnect ()
+  "Disconnect from collaboration server and cleanup."
+  (interactive)
+  ;; Leave all active files
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when noteworthy-collab--active
+        (noteworthy-collab-leave-file))))
+  
+  ;; Close socket
+  (when noteworthy-collab--socket
+    (websocket-close noteworthy-collab--socket)
+    (setq noteworthy-collab--socket nil))
+  
+  ;; Cancel timers
+  (when noteworthy-collab--reconnect-timer
+    (cancel-timer noteworthy-collab--reconnect-timer)
+    (setq noteworthy-collab--reconnect-timer nil))
+  
+  ;; Remove hook
+  (remove-hook 'find-file-hook #'noteworthy-collab--on-find-file)
+  
+  ;; Clear state
+  (setq noteworthy-collab--project-root nil
+        noteworthy-collab--server-url nil
+        noteworthy-collab--user-id nil
+        noteworthy-collab--user-color nil)
+  
+  (noteworthy-collab--log 'info "Disconnected"))
+
+;;;###autoload
+(defun noteworthy-collab-status ()
+  "Show current collaboration status."
+  (interactive)
+  (message "Noteworthy Collab: %s | User: %s | Project: %s"
+           (if (noteworthy-collab-connected-p) "Connected" "Disconnected")
+           (or noteworthy-collab--user-id "N/A")
+           (or noteworthy-collab--project-root "N/A")))
+
+;;;###autoload
+(defun noteworthy-collab-debug ()
+  "Show debug info for current buffer."
+  (interactive)
+  (noteworthy-collab--log 'info "=== DEBUG INFO ===")
+  (noteworthy-collab--log 'info "Buffer: %s" (buffer-name))
+  (noteworthy-collab--log 'info "File: %s" (buffer-file-name))
+  (noteworthy-collab--log 'info "Project root: %s" noteworthy-collab--project-root)
+  (noteworthy-collab--log 'info "File-path (local): %s" (if (boundp 'noteworthy-collab--file-path) noteworthy-collab--file-path "unbound"))
+  (noteworthy-collab--log 'info "Active (local): %s" (if (boundp 'noteworthy-collab--active) noteworthy-collab--active "unbound"))
+  (noteworthy-collab--log 'info "Connected: %s" (noteworthy-collab-connected-p))
+  (noteworthy-collab--log 'info "Socket: %s" noteworthy-collab--socket)
+  (noteworthy-collab--log 'info "after-change-functions (local): %d items" (length after-change-functions))
+  (noteworthy-collab--log 'info "  Contains our hook: %s" (memq #'noteworthy-collab--after-change after-change-functions))
+  (noteworthy-collab--log 'info "=== END DEBUG ===")
+  (noteworthy-collab-toggle-log))
+
+;;;###autoload
+(defun noteworthy-collab-test-delta ()
+  "Send a test delta to server (inserts and immediately deletes a space)."
+  (interactive)
+  (if (not (noteworthy-collab-connected-p))
+      (message "Not connected!")
+    (if (not noteworthy-collab--file-path)
+        (message "No file path set for this buffer!")
+      (let ((test-ops `[((retain . ,(1- (point)))) ((insert . " "))]))
+        (noteworthy-collab--log 'info "Sending TEST delta: %s" test-ops)
+        (noteworthy-collab--send
+         `((type . "delta")
+           (file . ,noteworthy-collab--file-path)
+           (ops . ,test-ops)))
+        (message "Test delta sent! Check server logs.")))))
+
+;;;###autoload
+(defun noteworthy-collab-track-user ()
+  "Jump to a remote user's cursor position.
+Prompts for username, auto-deduplicating if there are multiple with same name."
+  (interactive)
+  (let* ((users (hash-table-keys noteworthy-collab--remote-users))
+         (names-alist nil))
+    (if (null users)
+        (message "No remote users connected")
+      ;; Build list of names with deduplication
+      (dolist (user-id users)
+        (let* ((info (gethash user-id noteworthy-collab--remote-users))
+               (base-name (plist-get info :name))
+               (existing (cl-count-if (lambda (pair) 
+                                        (string-prefix-p base-name (car pair)))
+                                      names-alist))
+               (display-name (if (> existing 0)
+                                (format "%s (%d)" base-name (1+ existing))
+                              base-name)))
+          (push (cons display-name user-id) names-alist)))
+      
+      (let* ((choice (completing-read "Track user: " 
+                                      (mapcar #'car names-alist) nil t))
+             (user-id (cdr (assoc choice names-alist)))
+             (info (gethash user-id noteworthy-collab--remote-users)))
+        (when info
+          (let ((file (plist-get info :file))
+                (line (plist-get info :line))
+                (col (plist-get info :col)))
+            ;; Find or open the buffer
+            (when-let ((buf (noteworthy-collab--find-buffer-for-file file)))
+              (switch-to-buffer buf)
+              (goto-char (point-min))
+              (forward-line (1- line))
+              (move-to-column col)
+              (message "Jumped to %s at line %d" (plist-get info :name) line))))))))
+
+(provide 'noteworthy-collab)
+
+;;; noteworthy-collab.el ends here
