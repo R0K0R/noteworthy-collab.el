@@ -230,6 +230,89 @@ FMT and ARGS are passed to `format'."
 (defvar noteworthy-collab-chat-buffer "*noteworthy-chat*"
   "Name of the collaboration chat buffer.")
 
+(defcustom noteworthy-collab-chat-prompt "> "
+  "Prompt shown on the chat buffer's input line."
+  :type 'string
+  :group 'noteworthy-collab)
+
+(defvar-local noteworthy-collab-chat--input-start nil
+  "Marker at the start of the editable input line.
+Everything before it is history and stays read-only; incoming messages are
+inserted above it so they never disturb a half-typed line.")
+
+(defvar noteworthy-collab-chat-mode-map
+  (let ((map (make-sparse-keymap)))
+    (define-key map (kbd "RET") #'noteworthy-collab-chat-send)
+    (define-key map (kbd "C-c C-c") #'noteworthy-collab-chat-send)
+    (define-key map (kbd "C-a") #'noteworthy-collab-chat-beginning-of-input)
+    map)
+  "Keymap for `noteworthy-collab-chat-mode'.")
+
+(define-derived-mode noteworthy-collab-chat-mode fundamental-mode "NW-Chat"
+  "Major mode for the Noteworthy collaboration chat.
+Type at the prompt and press RET to send."
+  ;; No font-lock: the colours here are applied by hand per message (each
+  ;; peer has their own), and font-lock would overwrite them.
+  (font-lock-mode -1)
+  (setq-local scroll-conservatively 101)
+  (visual-line-mode 1))
+
+(with-eval-after-load 'evil
+  ;; Chat is a place to type, not to navigate: start in insert state, and let
+  ;; RET send rather than open a line.
+  (when (fboundp 'evil-set-initial-state)
+    (evil-set-initial-state 'noteworthy-collab-chat-mode 'insert))
+  (when (fboundp 'evil-define-key*)
+    (evil-define-key* '(insert normal) noteworthy-collab-chat-mode-map
+                      (kbd "RET") #'noteworthy-collab-chat-send)))
+
+(defun noteworthy-collab-chat--buffer ()
+  "Return the chat buffer, creating and initialising it if needed."
+  (let ((buf (get-buffer-create noteworthy-collab-chat-buffer)))
+    (with-current-buffer buf
+      (unless (derived-mode-p 'noteworthy-collab-chat-mode)
+        (noteworthy-collab-chat-mode))
+      (unless (markerp noteworthy-collab-chat--input-start)
+        (let ((inhibit-read-only t))
+          (goto-char (point-max))
+          (unless (bolp) (insert "\n"))
+          (insert (propertize noteworthy-collab-chat-prompt
+                              'face 'minibuffer-prompt
+                              'font-lock-face 'minibuffer-prompt
+                              'read-only t 'rear-nonsticky t 'front-sticky t))
+          (setq noteworthy-collab-chat--input-start (point-marker))
+          ;; Insertion type nil: text typed at the marker stays *after* it, so
+          ;; it belongs to the input line.  (With t, the marker advances past
+          ;; what you type and your line silently becomes history.)  History
+          ;; inserted before the prompt still pushes the marker along, because
+          ;; markers always move for insertions before them.
+          (set-marker-insertion-type noteworthy-collab-chat--input-start nil))))
+    buf))
+
+(defun noteworthy-collab-chat-beginning-of-input ()
+  "Move to the start of the input line, after the prompt."
+  (interactive)
+  (if (and (markerp noteworthy-collab-chat--input-start)
+           (>= (point) noteworthy-collab-chat--input-start))
+      (goto-char noteworthy-collab-chat--input-start)
+    (beginning-of-line)))
+
+(defun noteworthy-collab-chat-send ()
+  "Send the text on the input line."
+  (interactive)
+  (let* ((start noteworthy-collab-chat--input-start)
+         (text (and (markerp start)
+                    (string-trim (buffer-substring-no-properties start (point-max))))))
+    (cond
+     ((or (null text) (string-empty-p text))
+      (message "Nothing to send"))
+     (t
+      (let ((inhibit-read-only t))
+        (delete-region start (point-max)))
+      ;; No local echo: the hub broadcasts chat back to every client,
+      ;; including the sender, so echoing here would double every line.
+      (noteworthy-collab-send-chat text)))))
+
 (defun noteworthy-collab--display-chat (msg)
   "Display chat message MSG in the chat buffer.
 MSG contains userId, name, color, text, timestamp."
@@ -243,17 +326,30 @@ MSG contains userId, name, color, text, timestamp."
          (buf (get-buffer-create noteworthy-collab-chat-buffer)))
     
     (with-current-buffer buf
-      (goto-char (point-max))
-      (let ((inhibit-read-only t))
-        (insert (propertize (format "[%s] " timestamp)
-                            'face 'font-lock-comment-face)
-                (propertize (format "<%s> " name)
-                            'face `(:foreground ,color :weight bold))
-                text "\n"))
-      ;; Auto-scroll if visible
+      (let* ((start noteworthy-collab-chat--input-start)
+             ;; Insert above the prompt so a half-typed line survives.
+             (at (if (markerp start)
+                     (- (marker-position start) (length noteworthy-collab-chat-prompt))
+                   (point-max)))
+             (inhibit-read-only t)
+             ;; Set both `face' and `font-lock-face': whichever mode the buffer
+             ;; ends up in, one of the two is honoured.
+             (line (concat (propertize (format "[%s] " timestamp)
+                                       'face 'font-lock-comment-face
+                                       'font-lock-face 'font-lock-comment-face)
+                           (propertize (format "<%s> " name)
+                                       'face `(:foreground ,color :weight bold)
+                                       'font-lock-face `(:foreground ,color :weight bold))
+                           text "\n")))
+        (save-excursion
+          (goto-char at)
+          (insert (propertize line 'read-only t 'front-sticky t 'rear-nonsticky t))))
+      ;; Follow the conversation only when point is not in the input line,
+      ;; so scrolling back or typing is never yanked to the bottom.
       (when-let ((win (get-buffer-window buf)))
-        (with-selected-window win
-          (goto-char (point-max)))))))
+        (when (or (null noteworthy-collab-chat--input-start)
+                  (< (window-point win) noteworthy-collab-chat--input-start))
+          (with-selected-window win (goto-char (point-max))))))))
 
 (defun noteworthy-collab-send-chat (message)
   "Send a chat MESSAGE to the server."
@@ -277,7 +373,10 @@ MSG contains userId, name, color, text, timestamp."
 (defun noteworthy-collab-show-chat ()
   "Switch bottom window to chat."
   (interactive)
-  (noteworthy-collab--switch-bottom-buffer (get-buffer-create noteworthy-collab-chat-buffer)))
+  (let ((buf (noteworthy-collab-chat--buffer)))
+    (noteworthy-collab--switch-bottom-buffer buf)
+    (when-let ((win (get-buffer-window buf)))
+      (with-selected-window win (goto-char (point-max))))))
 
 (defun noteworthy-collab-show-typst-log ()
   "Switch bottom window to typst log (compilation buffer)."
@@ -296,25 +395,35 @@ MSG contains userId, name, color, text, timestamp."
 (defun noteworthy-collab--switch-bottom-buffer (buffer &optional mode-check)
   "Switch the bottom window to BUFFER.
 If MODE-CHECK (symbol) is provided, it tries to find a window with that major-mode."
-  (let ((target-window (cl-find-if
-                        (lambda (w)
-                          (let ((b (window-buffer w)))
-                            (or (string= (buffer-name b) noteworthy-collab-log-buffer)
-                                (string= (buffer-name b) noteworthy-collab-chat-buffer)
-                                (string= (buffer-name b) "*vterm*")
-                                (with-current-buffer b
-                                  (or (eq major-mode 'vterm-mode)
-                                      (eq major-mode 'compilation-mode))))))
-                        (window-list))))
+  (let ((target-window
+         (or
+          ;; The window we have used before, whatever is in it now.  Identifying
+          ;; it by its current buffer only worked while that buffer was one we
+          ;; recognised -- show the tinymist log there and the next M-t would
+          ;; split a new window instead of cycling.
+          (cl-find-if (lambda (w) (window-parameter w 'noteworthy-bottom)) (window-list))
+          (cl-find-if
+           (lambda (w)
+             (let ((b (window-buffer w)))
+               (or (string= (buffer-name b) noteworthy-collab-log-buffer)
+                   (string= (buffer-name b) noteworthy-collab-chat-buffer)
+                   (string= (buffer-name b) "*vterm*")
+                   (with-current-buffer b
+                     (or (eq major-mode 'vterm-mode)
+                         (eq major-mode 'compilation-mode))))))
+           (window-list)))))
     (if target-window
-        (with-selected-window target-window
-          (when buffer (switch-to-buffer buffer)))
+        (progn
+          (set-window-parameter target-window 'noteworthy-bottom t)
+          (with-selected-window target-window
+            (when buffer (switch-to-buffer buffer))))
       ;; If not found, split editor window
       (when buffer
         (when-let ((editor-win (cl-find-if (lambda (w) (window-parameter w 'noteworthy-editor)) (window-list))))
           (select-window editor-win)
           (let ((new-win (split-window-below (floor (* 0.75 (window-height))))))
             (select-window new-win)
+            (set-window-parameter new-win 'noteworthy-bottom t)
             (switch-to-buffer buffer)))))))
 
 ;;; ============================================================
@@ -634,6 +743,34 @@ the line has a tab in it."
                        (string= noteworthy-collab--file-path file-path))))
               (buffer-list)))
 
+(defcustom noteworthy-collab-stash-dir
+  (locate-user-emacs-file "noteworthy-collab-unsynced/")
+  "Where buffer text is stashed when a sync would otherwise discard it."
+  :type 'directory
+  :group 'noteworthy-collab)
+
+(defun noteworthy-collab--stash-unsynced (file)
+  "Write the current buffer to a stash file and return its path.
+Called when an incoming sync would replace text the server has never
+seen -- typing into a brand-new file before its first sync arrives, for
+instance.  The server's copy is authoritative and must win, or later
+deltas would apply to text nobody else has; but the text is not ours to
+throw away either."
+  (condition-case err
+      (let* ((dir (file-name-as-directory noteworthy-collab-stash-dir))
+             (path (expand-file-name
+                    (format "%s-%s"
+                            (format-time-string "%Y%m%d-%H%M%S")
+                            (file-name-nondirectory (or file (buffer-name))))
+                    dir)))
+        (make-directory dir t)
+        (write-region (point-min) (point-max) path nil 'quiet)
+        path)
+    (error
+     (noteworthy-collab--log 'error "Could not stash unsynced text: %s"
+                             (error-message-string err))
+     nil)))
+
 (defun noteworthy-collab--apply-sync (msg)
   "Apply full sync from server."
   (let* ((file (alist-get 'file msg))
@@ -642,6 +779,18 @@ the line has a tab in it."
          (buf (noteworthy-collab--find-buffer-for-file file)))
     (when buf
       (with-current-buffer buf
+        ;; This sync is about to replace the whole buffer.  If what is here
+        ;; differs from what the server sent, that text exists nowhere else --
+        ;; keep a copy before it goes.
+        (let ((local (buffer-substring-no-properties (point-min) (point-max))))
+          (when (and (> (length local) 0)
+                     (not (string= local (or content ""))))
+            (let ((stash (noteworthy-collab--stash-unsynced file)))
+              (message "Noteworthy collab: %s replaced by the server's copy%s"
+                       (buffer-name)
+                       (if stash (format "; your text saved to %s" stash) ""))
+              (noteworthy-collab--log 'warn "Sync replaced local text (stash: %s)"
+                                      (or stash "FAILED")))))
         ;; `noteworthy-collab--applying-remote' alone stops the echo (see
         ;; `noteworthy-collab--after-change').  We deliberately do NOT bind
         ;; `inhibit-modification-hooks': that would also silence typst-preview's
@@ -1032,6 +1181,31 @@ it resyncs."
                           (buffer-name)
                           (length after-change-functions)))
 
+(defun noteworthy-collab--refresh-modtime (buffer)
+  "Tell Emacs BUFFER matches its file again.
+The room rewrites the file within a debounce of every edit, so the
+buffer's recorded modtime goes stale constantly."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (when (and buffer-file-name (file-exists-p buffer-file-name))
+        (ignore-errors (set-visited-file-modtime))
+        (set-buffer-modified-p nil)))))
+
+(defun noteworthy-collab--supersession-advice (orig-fn filename)
+  "Skip the \"changed on disk, discard your edits?\" prompt in collab buffers.
+
+That question assumes the buffer and the file are rival versions of the
+same text.  Here they are not: the server owns the file and writes it
+from the shared document a moment after every edit, so the on-disk change
+*is* our own text coming back.  Answering it is meaningless, and it fires
+on essentially every keystroke after a peer edit."
+  (if (bound-and-true-p noteworthy-collab--active)
+      (ignore-errors (set-visited-file-modtime))
+    (funcall orig-fn filename)))
+
+(advice-add 'ask-user-about-supersession-threat :around
+            #'noteworthy-collab--supersession-advice)
+
 (defun noteworthy-collab--restore-read-only ()
   "Undo the read-only state forced on this buffer while disconnected.
 Does nothing if we never forced it, so a buffer the user made read-only
@@ -1064,11 +1238,31 @@ themselves stays that way."
   (remove-hook 'post-command-hook #'noteworthy-collab--post-command t)
   (remove-hook 'kill-buffer-hook #'noteworthy-collab--on-kill t))
 
+(defvar-local noteworthy-collab--modtime-timer nil)
+
+(defun noteworthy-collab--schedule-modtime-refresh (&rest _)
+  "Re-sync this buffer's modtime after the room has written the file.
+Deliberately NOT on `after-change-functions': `set-visited-file-modtime'
+stats the file, ~88ms over TRAMP, which per keystroke is the difference
+between fluent and unusable.  `ask-user-about-supersession-threat' is
+advised to re-sync on the rare occasion it actually matters."
+  (when (and noteworthy-collab--active buffer-file-name)
+    (let ((buf (current-buffer)))
+      (when (timerp noteworthy-collab--modtime-timer)
+        (cancel-timer noteworthy-collab--modtime-timer))
+      (setq noteworthy-collab--modtime-timer
+            (run-with-idle-timer
+             0.6 nil (lambda () (noteworthy-collab--refresh-modtime buf)))))))
+
 (defun noteworthy-collab--push-preview-on-change (_beg _end _len)
   "Push this buffer to a standalone tinymist session after any change.
 Local and remote edits alike -- both are the CRDT-merged text."
   (when (noteworthy-collab-preview-connected-p)
-    (noteworthy-collab-preview-push)))
+    (noteworthy-collab-preview-push))
+  ;; Repainting is handled by `noteworthy-collab-preview-repaint-mode', not
+  ;; from here: frames land whenever tinymist finishes compiling, which is
+  ;; not the same moment as an edit.
+  )
 
 (defun noteworthy-collab--after-change (beg end len)
   "Hook for after-change-functions. Send delta to server.
@@ -1275,16 +1469,27 @@ always runs."
 
 
 (defun noteworthy-collab--infer-preview-url (ws-url)
-  "Infer preview URL from WS-URL.
-Assumes tinymist is running on port 23625 on the same host."
-  (let* ((host (if (string-match "ws://\\([^/:]+\\)" ws-url)
-                   (match-string 1 ws-url)
-                 "localhost"))
-         (preview-url (format "http://%s:23625" host)))
-    (setq noteworthy-collab-preview-url preview-url)
-    (noteworthy-collab--log 'info "Inferred preview URL: %s" preview-url)
-    ;; Refresh preview if window exists
-    (noteworthy-collab-refresh-preview)))
+  "Infer preview URL from WS-URL when one has not been configured.
+Assumes tinymist is running on port 23625 on the same host.
+
+A configured URL always wins.  Guessing from the collab server's host is
+wrong whenever the preview is reached another way -- notably through an
+SSH tunnel, which is *required* when the project is remote: tinymist's
+data plane refuses any websocket whose Origin is not localhost, and the
+xwidget sends the URL it loaded from as its Origin."
+  (if noteworthy-collab-preview-url
+      (progn
+        (noteworthy-collab--log 'info "Keeping configured preview URL: %s"
+                                noteworthy-collab-preview-url)
+        (noteworthy-collab-refresh-preview))
+    (let* ((host (if (string-match "ws://\\([^/:]+\\)" ws-url)
+                     (match-string 1 ws-url)
+                   "localhost"))
+           (preview-url (format "http://%s:23625" host)))
+      (setq noteworthy-collab-preview-url preview-url)
+      (noteworthy-collab--log 'info "Inferred preview URL: %s" preview-url)
+      ;; Refresh preview if window exists
+      (noteworthy-collab-refresh-preview))))
 
 (defun noteworthy-collab--ws-to-http (ws-url)
   "Convert WebSocket URL to HTTP URL.

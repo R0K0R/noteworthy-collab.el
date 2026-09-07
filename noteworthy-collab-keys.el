@@ -21,11 +21,28 @@
   (define-key noteworthy-typst-mode-map (kbd "M-t d") #'noteworthy-collab-show-debug)
   (define-key noteworthy-typst-mode-map (kbd "M-t c") #'noteworthy-collab-show-chat)
   (define-key noteworthy-typst-mode-map (kbd "M-t l") #'noteworthy-collab-show-typst-log)
+  (define-key noteworthy-typst-mode-map (kbd "M-t p") #'noteworthy-collab-show-tinymist-log)
+  ;; noteworthy-evil binds M-o to noteworthy-typst-send-position, which only
+  ;; knows about a typst-preview.el session; ours dispatches to whichever
+  ;; preview is actually connected.
+  (define-key noteworthy-typst-mode-map (kbd "M-o") #'noteworthy-collab-send-position)
+  ;; noteworthy-evil binds M-o inside evil state maps, which shadow the plain
+  ;; mode map -- rebind there too or the old command keeps winning.
+  (when (fboundp 'evil-define-key*)
+    (evil-define-key* '(normal insert visual motion) noteworthy-typst-mode-map
+                      (kbd "M-o") #'noteworthy-collab-send-position))
   (when (fboundp 'evil-normalize-keymaps)
     (evil-normalize-keymaps)))
 
 ;; Depth 90 so this runs after noteworthy.el's own hooks and wins any conflict.
 (add-hook 'noteworthy-typst-mode-hook #'noteworthy-collab-keys-setup 90)
+
+;; Reloading this file does not re-run the mode hook, so buffers that already
+;; have noteworthy-typst-mode on would keep the old bindings.
+(dolist (buf (buffer-list))
+  (with-current-buffer buf
+    (when (bound-and-true-p noteworthy-typst-mode)
+      (ignore-errors (noteworthy-collab-keys-setup)))))
 
 (provide 'noteworthy-collab-keys)
 ;;; noteworthy-collab-keys.el ends here

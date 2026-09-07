@@ -51,6 +51,185 @@
   :type 'number
   :group 'noteworthy-collab)
 
+(defcustom noteworthy-collab-tinymist-log "logs/tinymist.log"
+  "Path of the tinymist preview log, relative to the project root.
+The preview runs on the machine holding the project, so its log lives
+there too -- this is the only place its compile output appears."
+  :type 'string
+  :group 'noteworthy-collab)
+
+(defun noteworthy-collab-typst-inputs (root)
+  "Return the typst `--input' flags for the project at ROOT, as a list.
+
+Mirrors `noteworthy.py --print-inputs': chapters are the numeric
+directories under content/, pages the numeric .typ files inside them, and
+page-folders is keyed by chapter *index* rather than folder name.  Without
+these the template falls back to 0-based names and looks for files that do
+not exist.  Computed with plain file operations so it works over TRAMP,
+where running the script would mean a remote process."
+  (let* ((content (expand-file-name "content" root))
+         (ch-dirs (when (file-directory-p content)
+                    (sort (seq-filter
+                           (lambda (d) (and (string-match-p "\\`[0-9]+\\'" d)
+                                            (file-directory-p (expand-file-name d content))))
+                           (directory-files content nil "\\`[^.]"))
+                          (lambda (a b) (< (string-to-number a) (string-to-number b))))))
+         (ch-folders nil) (pg-alist nil) (idx 0))
+    (dolist (ch ch-dirs)
+      (let* ((dir (expand-file-name ch content))
+             (pages (sort (delq nil (mapcar (lambda (f)
+                                              (when (string-match "\\`\\([0-9]+\\)\\.typ\\'" f)
+                                                (match-string 1 f)))
+                                            (directory-files dir nil nil)))
+                          (lambda (a b) (< (string-to-number a) (string-to-number b))))))
+        (when pages
+          (push ch ch-folders)
+          (push (cons (number-to-string idx) (vconcat pages)) pg-alist)
+          (setq idx (1+ idx)))))
+    (list "--input" (format "chapter-folders=%s" (json-encode (vconcat (nreverse ch-folders))))
+          "--input" (format "page-folders=%s" (json-encode (nreverse pg-alist))))))
+
+(defcustom noteworthy-collab-preview-data-port 23627
+  "Port the LSP-hosted preview serves its page and data plane on.
+Reach it over an SSH tunnel: tinymist refuses websockets whose Origin is
+not localhost, so a hostname URL loads the page and never streams it."
+  :type 'integer
+  :group 'noteworthy-collab)
+
+(defcustom noteworthy-collab-preview-control-port 23628
+  "Control-plane port requested when starting the preview.
+Note the LSP-hosted preview currently ignores this and opens only the
+data plane; scrolling goes through `tinymist.scrollPreview' instead."
+  :type 'integer
+  :group 'noteworthy-collab)
+
+(defcustom noteworthy-collab-preview-id "default_preview"
+  "Preview task id used by `tinymist.scrollPreview'.
+`tinymist.doStartPreview' names the primary preview this."
+  :type 'string
+  :group 'noteworthy-collab)
+
+(defcustom noteworthy-collab-preview-auto-repaint t
+  "Whether to force the preview xwidget to repaint after edits.
+Emacs only redraws an xwidget when something touches its window, so a
+preview that has just recompiled sits stale until the mouse moves over
+it."
+  :type 'boolean
+  :group 'noteworthy-collab)
+
+(defcustom noteworthy-collab-preview-repaint-interval 0.5
+  "Seconds between repaint nudges while a burst is active."
+  :type 'number
+  :group 'noteworthy-collab)
+
+(defcustom noteworthy-collab-preview-repaint-duration 2.0
+  "How long to keep nudging after a change.
+Long enough to cover tinymist recompiling and pushing the new frames."
+  :type 'number
+  :group 'noteworthy-collab)
+
+(defvar noteworthy-collab-preview--repaint-timer nil)
+(defvar noteworthy-collab-preview--repaint-until 0)
+
+(defun noteworthy-collab-preview--xwidget-windows ()
+  "Return (BUFFER . WINDOW) pairs for displayed webkit xwidgets."
+  (delq nil
+        (mapcar (lambda (buf)
+                  (when (string-match-p "xwidget-webkit" (buffer-name buf))
+                    (let ((win (get-buffer-window buf t)))
+                      (and win (cons buf win)))))
+                (buffer-list))))
+
+(defcustom noteworthy-collab-preview-repaint-method 'js
+  "How to make the preview xwidget repaint.
+
+`js\=' asks the page itself to repaint -- a scroll nudge plus a throwaway
+transform, ~0.01ms, and it makes WebKit produce a genuinely new frame,
+which is what Emacs needs in order to blit anything.
+`light\=' only marks the window dirty and redisplays: free, but Emacs
+happily redraws the stale pixmap, so it often changes nothing.
+`resize\=' forces a full WebKit relayout: ~780ms per call on a remote
+preview, enough to make typing visibly stutter.  Last resort."
+  :type '(choice (const :tag "Nudge the page from JS (free)" js)
+                 (const :tag "Redisplay the window (free, often ineffective)" light)
+                 (const :tag "Resize the widget (slow, last resort)" resize))
+  :group 'noteworthy-collab)
+
+(defun noteworthy-collab-preview-repaint ()
+  "Make the preview xwidget repaint now."
+  (interactive)
+  (dolist (pair (noteworthy-collab-preview--xwidget-windows))
+    (let ((buf (car pair)) (win (cdr pair)))
+      (when (eq noteworthy-collab-preview-repaint-method 'js)
+        (with-current-buffer buf
+          (let ((xw (ignore-errors (xwidget-webkit-current-session))))
+            (when xw
+              ;; Scroll by a pixel and back, then flip a transform on and off
+              ;; next frame: either produces a new frame, and both are
+              ;; visually identity operations.
+              (ignore-errors
+                (xwidget-webkit-execute-script
+                 xw (concat "(function(){var e=document.scrollingElement||document.documentElement;"
+                            "var y=e.scrollTop;e.scrollTop=y+1;e.scrollTop=y;"
+                            "var b=document.body;if(b){b.style.transform='translateZ(0)';"
+                            "requestAnimationFrame(function(){b.style.transform='';});}})();")))))))
+      (when (eq noteworthy-collab-preview-repaint-method 'resize)
+        (with-current-buffer buf
+          (let ((xw (ignore-errors (xwidget-webkit-current-session))))
+            (when xw
+              (let ((w (window-pixel-width win))
+                    (h (window-pixel-height win)))
+                (ignore-errors (xwidget-resize xw (max 1 (1- w)) h))
+                (ignore-errors (xwidget-resize xw w h)))))))
+      (force-window-update win)))
+  (when (memq noteworthy-collab-preview-repaint-method '(light resize))
+    (redisplay t)))
+
+(defun noteworthy-collab-preview--repaint-tick ()
+  "Repaint if a preview is on screen; otherwise do nothing.
+Deliberately not driven by editing hooks: frames arrive whenever tinymist
+finishes compiling -- after a peer\'s edit, a config change, a font
+change -- not only after something you typed."
+  (when (noteworthy-collab-preview--xwidget-windows)
+    (noteworthy-collab-preview-repaint)))
+
+;;;###autoload
+(define-minor-mode noteworthy-collab-preview-repaint-mode
+  "Keep the preview xwidget repainting on its own.
+
+Emacs only blits an xwidget when its window is touched, so a preview that
+has recompiled sits stale until the mouse crosses it.  There is no Emacs
+setting for this -- xwidget.el has no damage-to-redisplay path -- so a
+timer asks the page to produce a frame instead.  With
+`noteworthy-collab-preview-repaint-method\=' set to `js\=' a tick costs
+about 0.01ms and does nothing at all when no preview is displayed."
+  :global t
+  :group 'noteworthy-collab
+  (when (timerp noteworthy-collab-preview--repaint-timer)
+    (cancel-timer noteworthy-collab-preview--repaint-timer)
+    (setq noteworthy-collab-preview--repaint-timer nil))
+  (when noteworthy-collab-preview-repaint-mode
+    (setq noteworthy-collab-preview--repaint-timer
+          (run-with-timer noteworthy-collab-preview-repaint-interval
+                          noteworthy-collab-preview-repaint-interval
+                          #'noteworthy-collab-preview--repaint-tick))))
+
+(defun noteworthy-collab-preview-ensure-repaint ()
+  "Make sure something is keeping the preview xwidget repainted.
+Prefers noteworthy.el\'s own repaint mode when that package provides it,
+so the two do not each run a timer."
+  (when noteworthy-collab-preview-auto-repaint
+    (cond
+     ((fboundp 'noteworthy-preview-repaint-mode)
+      (unless (bound-and-true-p noteworthy-preview-repaint-mode)
+        (noteworthy-preview-repaint-mode 1)))
+     ((not noteworthy-collab-preview-repaint-mode)
+      (noteworthy-collab-preview-repaint-mode 1)))))
+
+(defun noteworthy-collab-preview-repaint-burst ()
+  "Compatibility shim for older callers."
+  (noteworthy-collab-preview-ensure-repaint))
+
 (defvar noteworthy-collab-preview--socket nil)
 (defvar noteworthy-collab-preview--timer nil)
 (defvar noteworthy-collab-preview--pending nil
@@ -164,7 +343,202 @@
     (when (noteworthy-collab-preview-connected-p)
       (noteworthy-collab--log 'info "Preview control plane: %s" target)
       (noteworthy-collab-preview--sync-all)
+      ;; The xwidget is created by the layout at init, so its page was very
+      ;; likely loaded while tinymist was still down -- it would sit on
+      ;; "connection refused" forever, since connecting the control plane says
+      ;; nothing to an already-loaded page. Reload it now that we know the
+      ;; preview is actually answering.
+      (when (fboundp 'noteworthy-collab-refresh-preview)
+        (ignore-errors (noteworthy-collab-refresh-preview)))
+      (message "Noteworthy preview connected: %s" target)
       t)))
+
+(defun noteworthy-collab--lsp-ready-p ()
+  "Return non-nil when the LSP in this buffer can take executeCommand."
+  (and (bound-and-true-p lsp-mode)
+       (ignore-errors (lsp-workspaces))
+       (ignore-errors
+         (let ((caps (lsp--server-capabilities)))
+           (and caps (lsp-get caps :executeCommandProvider))))))
+
+(defun noteworthy-collab--when-lsp-ready (buffer fn &optional attempts)
+  "Run FN in BUFFER once its language server is ready, polling once a second."
+  (let ((attempts (or attempts 40)))
+    (if (not (buffer-live-p buffer))
+        nil
+      (with-current-buffer buffer
+        (cond
+         ((noteworthy-collab--lsp-ready-p) (funcall fn))
+         ((<= attempts 0)
+          (message "Noteworthy: tinymist did not come back -- M-x noteworthy-collab-preview-start when it does"))
+         (t
+          (run-at-time 1 nil #'noteworthy-collab--when-lsp-ready
+                       buffer fn (1- attempts))))))))
+
+(defun noteworthy-collab-preview--master-file ()
+  "Return the project's master .typ as the remote host sees it."
+  (let ((master (or (bound-and-true-p noteworthy-collab-master-file)
+                    (and (bound-and-true-p noteworthy-collab-project-root)
+                         (expand-file-name "templates/core/parser.typ"
+                                           noteworthy-collab-project-root)))))
+    (and master (or (file-remote-p master 'localname) master))))
+
+;;;###autoload
+(defun noteworthy-collab-preview-start ()
+  "Ask the tinymist LSP to host the preview for this project.
+
+The preview is served by the language server, not by a standalone
+`tinymist preview\=' -- that one\='s data plane is broken in 0.15.x and
+never completes a websocket handshake."
+  (interactive)
+  (let ((root (or (and (bound-and-true-p noteworthy-collab-project-root)
+                       (or (file-remote-p noteworthy-collab-project-root 'localname)
+                           noteworthy-collab-project-root))
+                  (user-error "No project root -- run `noteworthy-remote-init\=' first")))
+        (main (noteworthy-collab-preview--master-file)))
+    (unless (and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
+      (user-error "No tinymist LSP in this buffer -- open a .typ file in the project"))
+    (ignore-errors
+      (lsp-request "workspace/executeCommand"
+                   (list :command "tinymist.doKillPreview" :arguments (vector))))
+    (let ((res (lsp-request
+                "workspace/executeCommand"
+                (list :command "tinymist.doStartPreview"
+                      :arguments
+                      (vector (vector "--data-plane-host"
+                                      (format "127.0.0.1:%d" noteworthy-collab-preview-data-port)
+                                      "--control-plane-host"
+                                      (format "127.0.0.1:%d" noteworthy-collab-preview-control-port)
+                                      "--invert-colors" "never"
+                                      "--root" (directory-file-name root)
+                                      main))))))
+      (noteworthy-collab-preview-ensure-repaint)
+      (noteworthy-collab-refresh-preview)
+      (message "Preview hosted on port %s"
+               (or (plist-get res :dataPlanePort) noteworthy-collab-preview-data-port))
+      res)))
+
+;;;###autoload
+(defun noteworthy-collab-reload-structure ()
+  "Pick up chapters/pages added or removed since the session started.
+
+The chapter/page mapping travels in the language server\'s
+initializationOptions, which are only read once, at startup -- so a new
+page is invisible to the preview until the server is restarted.  This
+restarts it and re-hosts the preview."
+  (interactive)
+  (let ((buf (current-buffer)))
+    (unless (and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
+      (user-error "No tinymist LSP in this buffer -- open a .typ file in the project"))
+    (message "Noteworthy: restarting tinymist to pick up the new structure...")
+    (ignore-errors
+      (lsp-request "workspace/executeCommand"
+                   (list :command "tinymist.doKillPreview" :arguments (vector))))
+    (ignore-errors (lsp-workspace-shutdown (car (lsp-workspaces))))
+    (run-at-time
+     2 nil
+     (lambda ()
+       (with-current-buffer buf
+         (let ((lsp-auto-guess-root t)) (ignore-errors (lsp)))
+         ;; Wait for the server to actually be able to take commands rather
+         ;; than guessing at a delay: over TRAMP it can take a good while, and
+         ;; asking too early fails with "does not support method
+         ;; workspace/executeCommand".
+         (noteworthy-collab--when-lsp-ready
+          buf
+          (lambda ()
+            (condition-case err
+                (progn (noteworthy-collab-preview-start)
+                       (message "Noteworthy: structure reloaded"))
+              (error
+               (message "Noteworthy: preview not restarted (%s) -- M-x noteworthy-collab-preview-start"
+                        (error-message-string err)))))))))))
+
+;;;###autoload
+(defun noteworthy-collab-preview-scroll-to-point ()
+  "Scroll the preview to the cursor position (typst-preview's panelScrollTo).
+
+`noteworthy-typst-send-position' cannot do this here: it goes through
+`typst-preview--local-master', a session typst-preview.el spawned itself.
+Ours is a tinymist on the project's machine that we talk to over the
+control plane, and the path has to be the one *that* host sees."
+  (interactive)
+  (unless buffer-file-name
+    (user-error "Buffer is not visiting a file"))
+  (let* ((path (noteworthy-collab-preview--server-path buffer-file-name))
+         (line (1- (line-number-at-pos)))
+         (char (max 0 (- (point) (line-beginning-position))))
+         (event (list :event "panelScrollTo" :filepath path
+                      :line line :character char)))
+    (cond
+     ;; A preview hosted by the tinymist LSP has no control-plane socket --
+     ;; it ignores --control-plane-host and takes scroll requests as a
+     ;; command instead. The buffer needs no pushing either: lsp-mode's
+     ;; didChange already gave the server this text.
+     ((and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
+      (lsp-request-async "workspace/executeCommand"
+                         (list :command "tinymist.scrollPreview"
+                               :arguments (vector noteworthy-collab-preview-id event))
+                         #'ignore :mode 'detached)
+      (message "Preview -> %s:%d:%d" (file-name-nondirectory path) (1+ line) char))
+     ;; A standalone preview does have a control plane; talk to it directly.
+     ((noteworthy-collab-preview-connected-p)
+      (noteworthy-collab-preview--push-buffers (list (current-buffer)))
+      (noteworthy-collab-preview--send
+       `(("event" . "panelScrollTo") ("filepath" . ,path)
+         ("line" . ,line) ("character" . ,char)))
+      (message "Preview -> %s:%d:%d" (file-name-nondirectory path) (1+ line) char))
+     (t
+      (user-error "No preview to scroll -- start one, or connect with `noteworthy-collab-preview-connect'")))))
+
+;;;###autoload
+(defun noteworthy-collab-send-position ()
+  "Scroll the preview to point, whichever preview is in use.
+Falls back to `noteworthy-typst-send-position' for a local
+typst-preview.el session, which is all that command knows about."
+  (interactive)
+  (if (or (and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
+          (noteworthy-collab-preview-connected-p))
+      (noteworthy-collab-preview-scroll-to-point)
+    (if (fboundp 'noteworthy-typst-send-position)
+        (call-interactively 'noteworthy-typst-send-position)
+      (user-error "No preview session to scroll"))))
+
+;;;###autoload
+(cl-defun noteworthy-collab-show-tinymist-log ()
+  "Show the tinymist preview log for this project, tailing it live.
+Opens it over TRAMP when the project is remote, so compile warnings and
+errors are visible without leaving Emacs."
+  (interactive)
+  ;; When the preview is hosted by the tinymist LSP (tinymist.doStartPreview)
+  ;; its output goes to the server's stderr buffer, not to a file on the
+  ;; project host -- prefer that when it exists.
+  (let* ((lsp-buf (car (seq-filter (lambda (b) (string-match-p "tinymist.*stderr" (buffer-name b)))
+                                   (buffer-list))))
+         (root (bound-and-true-p noteworthy-collab--project-root))
+         (file (and root (expand-file-name noteworthy-collab-tinymist-log root))))
+    (when lsp-buf
+      (with-current-buffer lsp-buf (goto-char (point-max)))
+      (if (fboundp 'noteworthy-collab--switch-bottom-buffer)
+          (noteworthy-collab--switch-bottom-buffer lsp-buf)
+        (pop-to-buffer lsp-buf)))
+    (when lsp-buf
+      (cl-return-from noteworthy-collab-show-tinymist-log lsp-buf))
+    (unless root
+      (user-error "No project root -- run `noteworthy-remote-init' first"))
+    (unless (file-exists-p file)
+      (user-error "No tinymist log at %s (is the preview running?)" file))
+    (let ((buf (find-file-noselect file)))
+      (with-current-buffer buf
+        (setq buffer-read-only t)
+        (goto-char (point-max))
+        ;; Tail it, so a compile that fails while you watch shows up.
+        (unless (bound-and-true-p auto-revert-tail-mode)
+          (auto-revert-tail-mode 1)))
+      (if (fboundp 'noteworthy-collab--switch-bottom-buffer)
+          (noteworthy-collab--switch-bottom-buffer buf)
+        (pop-to-buffer buf))
+      buf)))
 
 ;;;###autoload
 (defun noteworthy-collab-preview-disconnect ()

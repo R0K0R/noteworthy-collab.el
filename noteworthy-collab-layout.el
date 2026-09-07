@@ -23,6 +23,13 @@
 (defvar noteworthy-collab-master-file nil
   "Path to the master file (parser.typ).")
 
+(defvar noteworthy-collab--building-layout nil
+  "Non-nil while `noteworthy-collab-layout-init' is constructing windows.
+Window-size tracking must stay quiet then: splitting fires
+`window-size-change-functions' repeatedly with transient sizes, which
+would overwrite the widths `noteworthy-collab-load-settings' just read
+from .noteworthy-layout before they are ever applied.")
+
 (defvar noteworthy-collab-preview-width nil
   "Width of the preview window in columns.
 If nil, defaults to 35% of the frame width.")
@@ -116,6 +123,8 @@ If `noteworthy-collab-preview-url` is nil, creates a placeholder buffer."
         (ignore-errors (window-resize preview-window delta t)))
       (select-window preview-window)
       
+      (when (fboundp 'noteworthy-collab-preview-ensure-repaint)
+        (noteworthy-collab-preview-ensure-repaint))
       (if (and noteworthy-collab-preview-url (featurep 'xwidget-internal))
           (xwidget-webkit-browse-url noteworthy-collab-preview-url)
         ;; Placeholder buffer if URL not ready
@@ -182,7 +191,9 @@ Optional PDF-PATH-ARG specifies a PDF file to display."
       (setq noteworthy-collab-master-file master-path)
       (find-file master-path))
 
-    (let ((editor-window (selected-window)))
+    (let ((editor-window (selected-window))
+          ;; keep size tracking quiet until the layout is finished
+          (noteworthy-collab--building-layout t))
       (set-window-parameter editor-window 'noteworthy-editor t)
       (setq noteworthy-collab--editor-window editor-window)
 
@@ -201,6 +212,8 @@ Optional PDF-PATH-ARG specifies a PDF file to display."
       (select-window editor-window)
       (let ((term-window (split-window-below (floor (* 0.75 (window-height))))))
         (select-window term-window)
+        ;; Mark it so every M-t command cycles this one window.
+        (set-window-parameter term-window 'noteworthy-bottom t)
         (let ((default-directory dir)
               (shell-cmd (or noteworthy-collab-terminal-shell
                              (executable-find "bash")
@@ -237,22 +250,47 @@ Optional PDF-PATH-ARG specifies a PDF file to display."
       ;; Final: Restore focus to editor
       (select-window editor-window)
 
+      ;; Record the widths the layout actually produced, so .noteworthy-layout
+      ;; reflects reality even if the file had none.
+      (run-with-timer 0.3 nil (lambda ()
+                                (noteworthy-collab-track-window-sizes)
+                                (ignore-errors (noteworthy-collab-save-settings))))
       (message "Noteworthy Collab initialized: %s" dir))))
 
 ;;; ============================================================
 ;;; Window Size Tracking
 ;;; ============================================================
 
+(defvar noteworthy-collab--save-settings-timer nil)
+
+(defun noteworthy-collab--schedule-settings-save ()
+  "Persist window widths a little after the user stops dragging.
+`kill-emacs-hook' alone never fires in a daemon, so sizes were tracked
+but never written back to .noteworthy-layout."
+  (when (timerp noteworthy-collab--save-settings-timer)
+    (cancel-timer noteworthy-collab--save-settings-timer))
+  (setq noteworthy-collab--save-settings-timer
+        (run-with-idle-timer 2 nil (lambda ()
+                                     (ignore-errors (noteworthy-collab-save-settings))))))
+
 (defun noteworthy-collab-track-window-sizes (&optional frame)
   "Track size changes for Noteworthy windows and update variables."
-  (when (bound-and-true-p noteworthy-collab-project-root)
-    (let ((wins (window-list frame)))
+  (when (and (bound-and-true-p noteworthy-collab-project-root)
+             (not noteworthy-collab--building-layout))
+    (let ((wins (window-list frame))
+          (changed nil))
       (dolist (w wins)
         (cond
          ((window-parameter w 'noteworthy-pdf)
-          (setq noteworthy-collab-pdf-width (window-total-width w)))
+          (let ((width (window-total-width w)))
+            (unless (equal width noteworthy-collab-pdf-width)
+              (setq noteworthy-collab-pdf-width width changed t))))
          ((window-parameter w 'noteworthy-preview)
-          (setq noteworthy-collab-preview-width (window-total-width w))))))))
+          (let ((width (window-total-width w)))
+            (unless (equal width noteworthy-collab-preview-width)
+              (setq noteworthy-collab-preview-width width changed t))))))
+      (when changed
+        (noteworthy-collab--schedule-settings-save)))))
 
 (add-hook 'window-size-change-functions #'noteworthy-collab-track-window-sizes)
 
