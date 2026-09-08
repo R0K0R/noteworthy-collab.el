@@ -2,7 +2,7 @@
 
 ;; Author: r0k0r
 ;; Version: 0.1.0
-;; Package-Requires: ((emacs "29.1") (websocket "1.14") (typst-ts-mode "0.1"))
+;; Package-Requires: ((emacs "29.1") (websocket "1.14") (typst-ts-mode "0.1") (noteworthy "0.1"))
 ;; Keywords: typst, collaboration, tools
 ;; URL: https://github.com/R0K0R/noteworthy-collab.el
 
