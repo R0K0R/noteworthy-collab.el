@@ -534,6 +534,9 @@ the return value and report failure -- this function only logs to the
   (let ((type (alist-get 'type msg)))
     (pcase type
       ("welcome"
+       ;; A fresh connection means fresh ids; anything cached is from the
+       ;; previous one.
+       (noteworthy-collab--forget-remote-users)
        (setq noteworthy-collab--user-id (alist-get 'userId msg))
        (setq noteworthy-collab--user-color (alist-get 'color msg))
        (noteworthy-collab--update-user-cache-from-list (alist-get 'users msg))
@@ -638,12 +641,18 @@ Vectors are converted to lists; other non-list values return nil."
       (alist-get 'clientId msg)))
 
 (defun noteworthy-collab--point-from-line-col (line col)
-  "Translate 1-based LINE and 0-based COL to a point."
+  "Translate 1-based LINE and 1-based COL to a point.
+
+COL counts CHARACTERS, matching what `noteworthy-collab--line-col-at-pos\='
+sends and what the web editor means by a column.  Not `move-to-column\=':
+that counts *display* columns, so every double-width character (Korean,
+CJK, emoji) before the cursor pushed the overlay one column left of where
+the peer actually is."
   (save-excursion
     (goto-char (point-min))
     (forward-line (max 0 (1- (noteworthy-collab--safe-int line 1))))
-    (move-to-column (max 0 (noteworthy-collab--safe-int col 0)))
-    (point)))
+    (min (+ (point) (max 0 (1- (noteworthy-collab--safe-int col 1))))
+         (line-end-position))))
 
 (defun noteworthy-collab--normalize-range (start end)
   "Clamp START and END to buffer bounds and return (START . END)."
@@ -689,12 +698,12 @@ Vectors are converted to lists; other non-list values return nil."
 
 (defun noteworthy-collab--line-col-at-pos (pos)
   "Return (LINE . COL) at POS.
-COL is a character offset from the line start, not a display column --
-`current-column' disagrees with the web client's column model whenever
-the line has a tab in it."
+COL is 1-based and counts characters, matching the web client.  Not
+`current-column': that is a display column, and disagrees whenever the
+line holds a tab or a double-width character."
   (save-excursion
     (goto-char pos)
-    (cons (line-number-at-pos) (- pos (line-beginning-position)))))
+    (cons (line-number-at-pos) (1+ (- pos (line-beginning-position))))))
 
 (defun noteworthy-collab--store-remote-user (msg)
   "Store user identity and position fields from MSG."
@@ -715,6 +724,36 @@ the line has a tab in it."
   "Merge USERS into `noteworthy-collab--remote-users'."
   (dolist (user (noteworthy-collab--listify users))
     (noteworthy-collab--store-remote-user user)))
+
+(defun noteworthy-collab--replace-users-for-file (file users)
+  "Make USERS the complete set of remote users in FILE.
+
+A `users\=' packet is a snapshot, not a delta.  Merging it meant nobody
+was ever removed unless a `user_left\=' happened to arrive, so a peer who
+reconnected -- new id, same name -- showed up twice in the user list, and
+kept a stale caret."
+  (let ((present (make-hash-table :test 'equal))
+        (stale nil))
+    (dolist (user (noteworthy-collab--listify users))
+      (let ((id (noteworthy-collab--user-id-from-packet user)))
+        (when id (puthash id t present)))
+      (noteworthy-collab--store-remote-user user))
+    (maphash (lambda (id info)
+               (when (and (equal (plist-get info :file) file)
+                          (not (gethash id present)))
+                 (push id stale)))
+             noteworthy-collab--remote-users)
+    (dolist (id stale)
+      (noteworthy-collab--clear-cursor-overlays id)
+      (remhash id noteworthy-collab--remote-users))))
+
+(defun noteworthy-collab--forget-remote-users ()
+  "Drop every cached peer and their carets.
+Called when a session begins and ends: ids are handed out per connection,
+so anything held across one is stale by definition."
+  (maphash (lambda (id _info) (noteworthy-collab--clear-cursor-overlays id))
+           noteworthy-collab--remote-users)
+  (clrhash noteworthy-collab--remote-users))
 
 (defun noteworthy-collab--handle-user-presence (msg)
   "Handle presence packet MSG (`user_joined`, `user_updated`, `user_left`)."
@@ -1049,7 +1088,7 @@ behind there would either vanish uncleanly or end up pointing at nothing."
   "Handle users list update."
   (let* ((file (alist-get 'file msg))
          (users-list (noteworthy-collab--listify (alist-get 'users msg))))
-    (noteworthy-collab--update-user-cache-from-list users-list)
+    (noteworthy-collab--replace-users-for-file file users-list)
     (noteworthy-collab--log 'info "Users in %s: %s"
                             file
                             (mapconcat (lambda (u) (or (alist-get 'name u) "unknown"))
@@ -1206,6 +1245,28 @@ on essentially every keystroke after a peer edit."
 (advice-add 'ask-user-about-supersession-threat :around
             #'noteworthy-collab--supersession-advice)
 
+(defun noteworthy-collab--modtime-advice (orig-fn &optional buffer)
+  "Report collab buffers as matching their file.
+
+They do: the room writes the shared document to disk within a debounce of
+every edit, so a differing modtime means our own text came back, not a
+rival version.  Emacs otherwise asks \"changed on disk, reread?\" whenever
+something revisits the file -- notably a preview click asking the editor
+to jump to source -- and \"discard your edits?\" when you next type.
+
+Reverting would be actively wrong here: it would throw away the buffer
+that the CRDT session is attached to."
+  (let ((buf (or buffer (current-buffer))))
+    (if (buffer-live-p buf)
+        (with-current-buffer buf
+          (if (bound-and-true-p noteworthy-collab--active)
+              t
+            (funcall orig-fn buffer)))
+      (funcall orig-fn buffer))))
+
+(advice-add 'verify-visited-file-modtime :around
+            #'noteworthy-collab--modtime-advice)
+
 (defun noteworthy-collab--restore-read-only ()
   "Undo the read-only state forced on this buffer while disconnected.
 Does nothing if we never forced it, so a buffer the user made read-only
@@ -1343,10 +1404,13 @@ LEN is length of deleted text."
     (let ((msg `((type . "cursor")
                  (file . ,noteworthy-collab--file-path)
                  (line . ,(line-number-at-pos))
-                 ;; Character offset from line start, not `current-column' --
-                 ;; that's a DISPLAY column and disagrees with the web
-                 ;; client's character column whenever the line has a tab.
-                 (col . ,(- (point) (line-beginning-position))))))
+                 ;; 1-based, counting CHARACTERS.  Two separate traps here:
+                 ;; `current-column' is a DISPLAY column, so it disagrees on
+                 ;; any line with a tab or a double-width character; and the
+                 ;; wire format is Monaco's, whose columns start at 1 --
+                 ;; sending a 0-based one drew our caret one place to the
+                 ;; left of where it really was, on every client.
+                 (col . ,(1+ (- (point) (line-beginning-position)))))))
       ;; Add selection info in canonical line/column fields.
       ;; Keep legacy object shape for bridge compatibility during transition.
       (when (region-active-p)
@@ -1392,6 +1456,10 @@ matching \"sync\" arrives and `noteworthy-collab--apply-sync' sets it."
   (setq-local noteworthy-collab--file-path file-path)
   (noteworthy-collab--log 'info "Set buffer-local file-path to: %s" noteworthy-collab--file-path)
   (noteworthy-collab--setup-buffer)
+  ;; Keep tinymist compiling the whole document: opening a page otherwise
+  ;; re-points the compile at that page, without the project inputs.
+  (when (fboundp 'noteworthy-collab-preview--pin-main)
+    (ignore-errors (noteworthy-collab-preview--pin-main)))
   (when (noteworthy-collab-connected-p)
     (noteworthy-collab--join-file-internal file-path))
   (noteworthy-collab--log 'info "Joined: %s" file-path))
@@ -1586,7 +1654,39 @@ This sets up:
      (noteworthy-collab-layout-init tramp-path pdf-path)
      ;; Join CRDT for all already-open .typ files in the project
      (noteworthy-collab--join-open-buffers)
-     (noteworthy-collab--log 'info "Initialized session: %s" tramp-path))))
+     (noteworthy-collab--log 'info "Initialized session: %s" tramp-path)
+     (when noteworthy-collab-auto-start-preview
+       (noteworthy-collab--auto-start-preview)))))
+
+(defcustom noteworthy-collab-auto-start-preview t
+  "Whether `noteworthy-remote-init' should bring the preview up too.
+The preview is hosted by the tinymist language server, which takes a
+while to come up over TRAMP, so this waits for it rather than failing."
+  :type 'boolean
+  :group 'noteworthy-collab)
+
+(defun noteworthy-collab--auto-start-preview ()
+  "Start the preview once tinymist is ready, without blocking the session."
+  (let ((buf (seq-find (lambda (b)
+                         (with-current-buffer b
+                           (and buffer-file-name
+                                (string-suffix-p ".typ" buffer-file-name))))
+                       (buffer-list))))
+    (if (not buf)
+        (noteworthy-collab--log 'info "No .typ buffer yet; skipping preview auto-start")
+      (with-current-buffer buf
+        ;; typst-ts-mode normally starts the server; nudge it if it did not.
+        (unless (and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
+          (ignore-errors (let ((lsp-auto-guess-root t)) (lsp)))))
+      (message "Noteworthy: waiting for tinymist to start the preview...")
+      (noteworthy-collab--when-lsp-ready
+       buf
+       (lambda ()
+         (condition-case err
+             (noteworthy-collab-preview-start)
+           (error
+            (message "Noteworthy: preview not started (%s) -- M-x noteworthy-collab-preview-start"
+                     (error-message-string err)))))))))
 
 (defun noteworthy-collab--join-open-buffers ()
   "Join CRDT session for all open .typ files in the project."
@@ -1615,6 +1715,9 @@ This sets up:
   (when noteworthy-collab--socket
     (websocket-close noteworthy-collab--socket)
     (setq noteworthy-collab--socket nil))
+
+  ;; Peers and their carets belong to the connection that just ended.
+  (noteworthy-collab--forget-remote-users)
   
   ;; Cancel timers
   (when noteworthy-collab--reconnect-timer
@@ -1641,6 +1744,46 @@ This sets up:
   ;; restored it, and --on-close no longer re-marks it).
   (setq noteworthy-collab--disconnecting nil)
   (noteworthy-collab--log 'info "Disconnected"))
+
+;;;###autoload
+(defun noteworthy-collab-end-session (&optional cleanup-tramp)
+  "End the remote session cleanly.
+
+Stops the preview on the project host, disconnects, restores the editor
+state this package changed, and closes the tunnel it opened.  With a
+prefix argument, also drops the TRAMP connection."
+  (interactive "P")
+  ;; 1. stop the preview, or it keeps compiling on the remote host
+  (dolist (buf (buffer-list))
+    (with-current-buffer buf
+      (when (and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
+        (ignore-errors
+          (lsp-request "workspace/executeCommand"
+                       (list :command "tinymist.doKillPreview" :arguments (vector)))))))
+  ;; 2. drop memory overlays and stop repainting
+  (ignore-errors (noteworthy-collab-preview-disconnect))
+  (when (bound-and-true-p noteworthy-collab-preview-repaint-mode)
+    (noteworthy-collab-preview-repaint-mode -1))
+  (when (bound-and-true-p noteworthy-preview-repaint-mode)
+    (noteworthy-preview-repaint-mode -1))
+  ;; 3. leave every file and restore read-only / auto-save state
+  (ignore-errors (noteworthy-collab-disconnect))
+  ;; 4. close the tunnel we opened (an externally started one is left alone)
+  (when (process-live-p (bound-and-true-p noteworthy-collab-preview--tunnel-process))
+    (delete-process noteworthy-collab-preview--tunnel-process)
+    (setq noteworthy-collab-preview--tunnel-process nil))
+  ;; 5. session buffers, including the xwidget -- that is a live WebKit process
+  (dolist (buf (buffer-list))
+    (let ((name (buffer-name buf)))
+      (when (or (string-match-p "xwidget-webkit" name)
+                (member name (list noteworthy-collab-log-buffer
+                                   noteworthy-collab-chat-buffer
+                                   "*noteworthy-terminal*")))
+        (ignore-errors (kill-buffer buf)))))
+  (when cleanup-tramp
+    (ignore-errors (tramp-cleanup-all-connections)))
+  (message "Noteworthy collab: session ended%s"
+           (if cleanup-tramp " (TRAMP connections dropped)" "")))
 
 ;;;###autoload
 (defun noteworthy-collab-status ()

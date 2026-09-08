@@ -103,6 +103,68 @@ data plane; scrolling goes through `tinymist.scrollPreview' instead."
   :type 'integer
   :group 'noteworthy-collab)
 
+(defcustom noteworthy-collab-preview-tunnel-host 'auto
+  "Host to forward the preview ports from, or nil to manage tunnels yourself.
+`auto\=' takes the host from the project root, so a project opened as
+/sshx:yulee:... tunnels to yulee."
+  :type '(choice (const :tag "Take it from the project root" auto)
+                 (const :tag "Do not manage a tunnel" nil)
+                 (string :tag "Host"))
+  :group 'noteworthy-collab)
+
+(defvar noteworthy-collab-preview--tunnel-process nil)
+
+(defvar noteworthy-collab-preview--inputs nil
+  "Chapter/page mapping the running language server was started with.
+The mapping travels in initializationOptions and is only read once, so a
+chapter or page added since then is invisible until the server restarts.")
+
+(defun noteworthy-collab-preview--tunnel-target ()
+  "Return the host to tunnel to, or nil."
+  (pcase noteworthy-collab-preview-tunnel-host
+    ('nil nil)
+    ('auto (and (bound-and-true-p noteworthy-collab-project-root)
+                (file-remote-p noteworthy-collab-project-root 'host)))
+    (host host)))
+
+(defun noteworthy-collab-preview--port-listening-p (port)
+  "Return non-nil if something accepts connections on localhost PORT."
+  (condition-case nil
+      (let ((proc (open-network-stream "nw-port-probe" nil "127.0.0.1" port)))
+        (delete-process proc) t)
+    (error nil)))
+
+;;;###autoload
+(defun noteworthy-collab-preview-ensure-tunnel ()
+  "Forward the preview ports from the project host, if needed.
+
+The preview must be reached over localhost -- tinymist refuses any
+websocket whose Origin is not localhost, so pointing the pane at a
+hostname loads the page and never streams the document."
+  (interactive)
+  (let ((host (noteworthy-collab-preview--tunnel-target))
+        (data noteworthy-collab-preview-data-port)
+        (control noteworthy-collab-preview-control-port))
+    (cond
+     ((null host) nil)
+     ((process-live-p noteworthy-collab-preview--tunnel-process)
+      noteworthy-collab-preview--tunnel-process)
+     ((noteworthy-collab-preview--port-listening-p data)
+      (noteworthy-collab--log 'info "Preview port %d already forwarded" data)
+      t)
+     (t
+      (setq noteworthy-collab-preview--tunnel-process
+            (start-process "noteworthy-preview-tunnel" " *noteworthy-preview-tunnel*"
+                           "ssh" "-N"
+                           "-o" "ExitOnForwardFailure=yes"
+                           "-L" (format "%d:127.0.0.1:%d" data data)
+                           "-L" (format "%d:127.0.0.1:%d" control control)
+                           host))
+      (set-process-query-on-exit-flag noteworthy-collab-preview--tunnel-process nil)
+      (sleep-for 2)
+      (message "Preview tunnel to %s on %d/%d" host data control)
+      noteworthy-collab-preview--tunnel-process))))
+
 (defcustom noteworthy-collab-preview-id "default_preview"
   "Preview task id used by `tinymist.scrollPreview'.
 `tinymist.doStartPreview' names the primary preview this."
@@ -383,14 +445,27 @@ so the two do not each run a timer."
                                            noteworthy-collab-project-root)))))
     (and master (or (file-remote-p master 'localname) master))))
 
+(defun noteworthy-collab-preview--page-alive-p ()
+  "Return non-nil if a preview is already answering on the data port."
+  (let ((url (format "http://localhost:%d/" noteworthy-collab-preview-data-port)))
+    (condition-case nil
+        (with-timeout (3 nil)
+          (let ((buf (url-retrieve-synchronously url t t 3)))
+            (when buf
+              (prog1 (with-current-buffer buf
+                       (goto-char (point-min))
+                       (looking-at-p "HTTP/1.[01] 200"))
+                (kill-buffer buf)))))
+      (error nil))))
+
 ;;;###autoload
-(defun noteworthy-collab-preview-start ()
+(cl-defun noteworthy-collab-preview-start (&optional force)
   "Ask the tinymist LSP to host the preview for this project.
 
 The preview is served by the language server, not by a standalone
 `tinymist preview\=' -- that one\='s data plane is broken in 0.15.x and
 never completes a websocket handshake."
-  (interactive)
+  (interactive "P")
   (let ((root (or (and (bound-and-true-p noteworthy-collab-project-root)
                        (or (file-remote-p noteworthy-collab-project-root 'localname)
                            noteworthy-collab-project-root))
@@ -398,10 +473,39 @@ never completes a websocket handshake."
         (main (noteworthy-collab-preview--master-file)))
     (unless (and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
       (user-error "No tinymist LSP in this buffer -- open a .typ file in the project"))
+    (noteworthy-collab-preview-ensure-tunnel)
+    ;; Pick up chapters/pages added since the server started.  Their mapping
+    ;; only reaches tinymist through initializationOptions, so a changed
+    ;; structure means restarting it -- otherwise the preview renders an
+    ;; outline that no longer matches the files.
+    (let ((now (ignore-errors (noteworthy-collab-typst-inputs
+                               (or (bound-and-true-p noteworthy-collab-project-root)
+                                   default-directory)))))
+      (when (and now noteworthy-collab-preview--inputs
+                 (not (equal now noteworthy-collab-preview--inputs))
+                 (not force))
+        (setq noteworthy-collab-preview--inputs now)
+        (message "Noteworthy: structure changed, restarting tinymist...")
+        (cl-return-from noteworthy-collab-preview-start
+          (noteworthy-collab-reload-structure)))
+      (setq noteworthy-collab-preview--inputs now))
+    ;; Reuse a preview that is already serving.  Killing and immediately
+    ;; re-binding the same port is what makes doStartPreview hang: the old
+    ;; task has not released it yet, and tinymist has been seen to panic in
+    ;; tool/preview/http.rs and take the whole language server with it.
+    (when (and (not force) (noteworthy-collab-preview--page-alive-p))
+      (noteworthy-collab-preview-ensure-repaint)
+      (noteworthy-collab-refresh-preview)
+      (message "Preview already running on port %d" noteworthy-collab-preview-data-port)
+      (cl-return-from noteworthy-collab-preview-start
+        (list :dataPlanePort noteworthy-collab-preview-data-port :reused t)))
     (ignore-errors
       (lsp-request "workspace/executeCommand"
                    (list :command "tinymist.doKillPreview" :arguments (vector))))
-    (let ((res (lsp-request
+    ;; Let the old task release the port before asking for a new one.
+    (sleep-for 2)
+    (let* ((lsp-response-timeout 30)
+           (res (lsp-request
                 "workspace/executeCommand"
                 (list :command "tinymist.doStartPreview"
                       :arguments
@@ -412,11 +516,37 @@ never completes a websocket handshake."
                                       "--invert-colors" "never"
                                       "--root" (directory-file-name root)
                                       main))))))
+      ;; Keep the whole document as the compile target; otherwise focusing a
+      ;; page leaves the preview with nothing to render.
+      (ignore-errors (noteworthy-collab-preview--pin-main main))
       (noteworthy-collab-preview-ensure-repaint)
       (noteworthy-collab-refresh-preview)
       (message "Preview hosted on port %s"
                (or (plist-get res :dataPlanePort) noteworthy-collab-preview-data-port))
       res)))
+
+(defun noteworthy-collab-preview--pin-main (&optional file)
+  "Pin FILE (default the project master) as tinymist\'s compile target.
+
+Always done, never asked for: the preview renders whatever the primary
+compile task produces, and focusing a page re-points that task at the
+single file *and drops the project inputs* -- so the template compiles
+without the chapter/page mapping, fails, and the preview falls back to
+\"document is not ready\".  Pinning keeps the whole document as the target
+regardless of which page has focus."
+  (let ((main (or file (noteworthy-collab-preview--master-file))))
+    (when (and main
+               (bound-and-true-p lsp-mode)
+               (ignore-errors (lsp-workspaces)))
+      (condition-case err
+          (progn
+            (lsp-request "workspace/executeCommand"
+                         (list :command "tinymist.pinMain" :arguments (vector main)))
+            (noteworthy-collab--log 'info "Pinned compile target: %s" main)
+            t)
+        (error
+         (noteworthy-collab--log 'warn "Could not pin main (%s)" (error-message-string err))
+         nil)))))
 
 ;;;###autoload
 (defun noteworthy-collab-reload-structure ()
@@ -476,10 +606,17 @@ control plane, and the path has to be the one *that* host sees."
      ;; command instead. The buffer needs no pushing either: lsp-mode's
      ;; didChange already gave the server this text.
      ((and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
+      ;; Report what the server says.  This used to pass `ignore\=' as the
+      ;; callback, so a preview id that no longer existed -- after a preview
+      ;; restart, say -- failed in total silence, and M-o simply did nothing.
       (lsp-request-async "workspace/executeCommand"
                          (list :command "tinymist.scrollPreview"
                                :arguments (vector noteworthy-collab-preview-id event))
-                         #'ignore :mode 'detached)
+                         #'ignore :mode 'detached
+                         :error-handler
+                         (lambda (err)
+                           (message "Preview scroll refused (id %s): %s"
+                                    noteworthy-collab-preview-id err)))
       (message "Preview -> %s:%d:%d" (file-name-nondirectory path) (1+ line) char))
      ;; A standalone preview does have a control plane; talk to it directly.
      ((noteworthy-collab-preview-connected-p)
