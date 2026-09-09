@@ -35,6 +35,13 @@
 
 ;;; Code:
 
+;; Deliberately NOT `with-lsp-workspace': that is a macro, so it must be
+;; available when this file is byte-compiled or the call is left as a function
+;; call and dies at runtime with "Invalid function: with-lsp-workspace" -- which
+;; is exactly what a packaging build produced.  It expands to nothing more than
+;; a let on `lsp--cur-workspace', so bind that directly and depend on no macro.
+(defvar lsp--cur-workspace)
+
 (require 'websocket)
 (require 'json)
 ;; cl-pushnew and seq-filter below are not autoloaded.
@@ -500,13 +507,13 @@ never completes a websocket handshake."
       (cl-return-from noteworthy-collab-preview-start
         (list :dataPlanePort noteworthy-collab-preview-data-port :reused t)))
     (ignore-errors
-      (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+      (let ((lsp--cur-workspace (noteworthy-collab-preview--tinymist-workspace)))
         (lsp-request "workspace/executeCommand"
                      (list :command "tinymist.doKillPreview" :arguments (vector)))))
     ;; Let the old task release the port before asking for a new one.
     (sleep-for 2)
     (let* ((lsp-response-timeout 30)
-           (res (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+           (res (let ((lsp--cur-workspace (noteworthy-collab-preview--tinymist-workspace)))
                  (lsp-request
                 "workspace/executeCommand"
                 (list :command "tinymist.doStartPreview"
@@ -542,7 +549,7 @@ regardless of which page has focus."
                (ignore-errors (lsp-workspaces)))
       (condition-case err
           (progn
-            (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+            (let ((lsp--cur-workspace (noteworthy-collab-preview--tinymist-workspace)))
               (lsp-request "workspace/executeCommand"
                            (list :command "tinymist.pinMain" :arguments (vector main))))
             (noteworthy-collab--log 'info "Pinned compile target: %s" main)
@@ -565,7 +572,7 @@ restarts it and re-hosts the preview."
       (user-error "No tinymist LSP in this buffer -- open a .typ file in the project"))
     (message "Noteworthy: restarting tinymist to pick up the new structure...")
     (ignore-errors
-      (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+      (let ((lsp--cur-workspace (noteworthy-collab-preview--tinymist-workspace)))
         (lsp-request "workspace/executeCommand"
                      (list :command "tinymist.doKillPreview" :arguments (vector)))))
     (ignore-errors (lsp-workspace-shutdown (car (lsp-workspaces))))
@@ -636,7 +643,7 @@ control plane, and the path has to be the one *that* host sees."
       ;; Report what the server says.  This used to pass `ignore\=' as the
       ;; callback, so a preview id that no longer existed -- after a preview
       ;; restart, say -- failed in total silence, and M-o simply did nothing.
-      (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+      (let ((lsp--cur-workspace (noteworthy-collab-preview--tinymist-workspace)))
         (lsp-request-async "workspace/executeCommand"
                            (list :command "tinymist.scrollPreview"
                                  :arguments (vector noteworthy-collab-preview-id event))
