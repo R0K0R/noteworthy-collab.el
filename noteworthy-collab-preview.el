@@ -500,12 +500,14 @@ never completes a websocket handshake."
       (cl-return-from noteworthy-collab-preview-start
         (list :dataPlanePort noteworthy-collab-preview-data-port :reused t)))
     (ignore-errors
-      (lsp-request "workspace/executeCommand"
-                   (list :command "tinymist.doKillPreview" :arguments (vector))))
+      (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+        (lsp-request "workspace/executeCommand"
+                     (list :command "tinymist.doKillPreview" :arguments (vector)))))
     ;; Let the old task release the port before asking for a new one.
     (sleep-for 2)
     (let* ((lsp-response-timeout 30)
-           (res (lsp-request
+           (res (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+                 (lsp-request
                 "workspace/executeCommand"
                 (list :command "tinymist.doStartPreview"
                       :arguments
@@ -515,7 +517,7 @@ never completes a websocket handshake."
                                       (format "127.0.0.1:%d" noteworthy-collab-preview-control-port)
                                       "--invert-colors" "never"
                                       "--root" (directory-file-name root)
-                                      main))))))
+                                      main)))))))
       ;; Keep the whole document as the compile target; otherwise focusing a
       ;; page leaves the preview with nothing to render.
       (ignore-errors (noteworthy-collab-preview--pin-main main))
@@ -540,8 +542,9 @@ regardless of which page has focus."
                (ignore-errors (lsp-workspaces)))
       (condition-case err
           (progn
-            (lsp-request "workspace/executeCommand"
-                         (list :command "tinymist.pinMain" :arguments (vector main)))
+            (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+              (lsp-request "workspace/executeCommand"
+                           (list :command "tinymist.pinMain" :arguments (vector main))))
             (noteworthy-collab--log 'info "Pinned compile target: %s" main)
             t)
         (error
@@ -562,8 +565,9 @@ restarts it and re-hosts the preview."
       (user-error "No tinymist LSP in this buffer -- open a .typ file in the project"))
     (message "Noteworthy: restarting tinymist to pick up the new structure...")
     (ignore-errors
-      (lsp-request "workspace/executeCommand"
-                   (list :command "tinymist.doKillPreview" :arguments (vector))))
+      (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+        (lsp-request "workspace/executeCommand"
+                     (list :command "tinymist.doKillPreview" :arguments (vector)))))
     (ignore-errors (lsp-workspace-shutdown (car (lsp-workspaces))))
     (run-at-time
      2 nil
