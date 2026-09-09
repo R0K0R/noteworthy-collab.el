@@ -70,7 +70,8 @@ there too -- this is the only place its compile output appears."
 
 Mirrors `noteworthy.py --print-inputs': chapters are the numeric
 directories under content/, pages the numeric .typ files inside them, and
-page-folders is keyed by chapter *index* rather than folder name.  Without
+page-folders is keyed by the chapter's FOLDER NAME, matching
+`utils.scan_content' and the lookup in parser.typ.  Without
 these the template falls back to 0-based names and looks for files that do
 not exist.  Computed with plain file operations so it works over TRAMP,
 where running the script would mean a remote process."
@@ -91,7 +92,7 @@ where running the script would mean a remote process."
                           (lambda (a b) (< (string-to-number a) (string-to-number b))))))
         (when pages
           (push ch ch-folders)
-          (push (cons (number-to-string idx) (vconcat pages)) pg-alist)
+          (push (cons ch (vconcat pages)) pg-alist)
           (setq idx (1+ idx)))))
     (list "--input" (format "chapter-folders=%s" (json-encode (vconcat (nreverse ch-folders))))
           "--input" (format "page-folders=%s" (json-encode (nreverse pg-alist))))))
