@@ -585,6 +585,14 @@ restarts it and re-hosts the preview."
                         (error-message-string err)))))))))))
 
 ;;;###autoload
+(defun noteworthy-collab-preview--tinymist-workspace ()
+  "A live tinymist workspace from the session, whatever buffer we are in."
+  (or (car (ignore-errors (lsp-workspaces)))
+      (seq-find (lambda (w)
+                  (string-match-p "tinymist"
+                                  (format "%s" (lsp--workspace-server-id w))))
+                (ignore-errors (lsp--session-workspaces (lsp-session))))))
+
 (defun noteworthy-collab-preview-scroll-to-point ()
   "Scroll the preview to the cursor position (typst-preview's panelScrollTo).
 
@@ -593,8 +601,20 @@ restarts it and re-hosts the preview."
 Ours is a tinymist on the project's machine that we talk to over the
 control plane, and the path has to be the one *that* host sees."
   (interactive)
-  (unless buffer-file-name
-    (user-error "Buffer is not visiting a file"))
+  ;; Two ways this used to do nothing, which is why it "worked sometimes":
+  ;; pressed in the preview pane there is no file, and pressed in a content
+  ;; file whose own LSP had not started yet the cond fell through to "No
+  ;; preview to scroll".  Neither needs to fail: the event names the file
+  ;; explicitly, and any tinymist workspace for the project can carry it.
+  (let ((src (if buffer-file-name
+                 (current-buffer)
+               (seq-find (lambda (b)
+                           (let ((f (buffer-local-value 'buffer-file-name b)))
+                             (and f (string-suffix-p ".typ" f))))
+                         (buffer-list)))))
+    (unless src (user-error "No Typst buffer to scroll from"))
+    (unless (eq src (current-buffer))
+      (set-buffer src)))
   (let* ((path (noteworthy-collab-preview--server-path buffer-file-name))
          (line (1- (line-number-at-pos)))
          (char (max 0 (- (point) (line-beginning-position))))
@@ -605,18 +625,22 @@ control plane, and the path has to be the one *that* host sees."
      ;; it ignores --control-plane-host and takes scroll requests as a
      ;; command instead. The buffer needs no pushing either: lsp-mode's
      ;; didChange already gave the server this text.
-     ((and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
+     ;; Any tinymist workspace in the session will do -- requiring one in THIS
+     ;; buffer meant a just-opened content file could not scroll until
+     ;; something else had started its LSP.
+     ((noteworthy-collab-preview--tinymist-workspace)
       ;; Report what the server says.  This used to pass `ignore\=' as the
       ;; callback, so a preview id that no longer existed -- after a preview
       ;; restart, say -- failed in total silence, and M-o simply did nothing.
-      (lsp-request-async "workspace/executeCommand"
-                         (list :command "tinymist.scrollPreview"
-                               :arguments (vector noteworthy-collab-preview-id event))
-                         #'ignore :mode 'detached
-                         :error-handler
-                         (lambda (err)
-                           (message "Preview scroll refused (id %s): %s"
-                                    noteworthy-collab-preview-id err)))
+      (with-lsp-workspace (noteworthy-collab-preview--tinymist-workspace)
+        (lsp-request-async "workspace/executeCommand"
+                           (list :command "tinymist.scrollPreview"
+                                 :arguments (vector noteworthy-collab-preview-id event))
+                           #'ignore :mode 'detached
+                           :error-handler
+                           (lambda (err)
+                             (message "Preview scroll refused (id %s): %s"
+                                      noteworthy-collab-preview-id err))))
       (message "Preview -> %s:%d:%d" (file-name-nondirectory path) (1+ line) char))
      ;; A standalone preview does have a control plane; talk to it directly.
      ((noteworthy-collab-preview-connected-p)
