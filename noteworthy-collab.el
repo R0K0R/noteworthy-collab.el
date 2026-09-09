@@ -1622,7 +1622,18 @@ This sets up:
                   (progn
                     (noteworthy-collab--log 'info "Tinymist preview at: %s" preview-url)
                     (require 'noteworthy-collab-layout)
-                    (setq noteworthy-collab-preview-url preview-url)
+                    ;; A configured URL wins, exactly as in
+                    ;; `noteworthy-collab--infer-preview-url'.  The server
+                    ;; reports its own hostname, but tinymist binds 127.0.0.1
+                    ;; and refuses any websocket whose Origin is not
+                    ;; localhost -- so http://<host>:PORT loads nothing and
+                    ;; the pane shows "Connection refused".  The tunnelled
+                    ;; localhost URL is the one that works.
+                    (if noteworthy-collab-preview-url
+                        (noteworthy-collab--log
+                         'info "Keeping configured preview URL: %s (server offered %s)"
+                         noteworthy-collab-preview-url preview-url)
+                      (setq noteworthy-collab-preview-url preview-url))
                     ;; Force refresh of placeholder with actual URL
                     (noteworthy-collab-refresh-preview))
                 (noteworthy-collab--log 'warn "Tinymist preview not available"))))))
