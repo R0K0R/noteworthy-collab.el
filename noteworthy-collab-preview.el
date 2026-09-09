@@ -65,6 +65,34 @@ there too -- this is the only place its compile output appears."
   :type 'string
   :group 'noteworthy-collab)
 
+(defvar noteworthy-collab-typst-inputs--cache nil
+  "Cached `noteworthy-collab-typst-inputs\=' results, keyed by project root.
+
+The uncached function reads the project with ordinary file operations,
+which over TRAMP are TRAMP calls -- and `lsp--start-workspace\=' is already
+inside one when it asks for initializationOptions.  The reentrant call
+errors and is swallowed, so tinymist would start with no inputs at all.
+Compute it somewhere safe and read the cache there instead.
+
+Anything that changes the chapter/page structure must call
+`noteworthy-collab-typst-inputs-invalidate\=', or a tinymist restart will
+faithfully re-send the mapping the structure just stopped having.")
+
+(defun noteworthy-collab-typst-inputs-invalidate ()
+  "Forget cached input flags, so the next read rescans the project."
+  (setq noteworthy-collab-typst-inputs--cache nil))
+
+(defun noteworthy-collab-typst-inputs-cached (root &optional force)
+  "Return `noteworthy-collab-typst-inputs\=' for ROOT, caching the result.
+With FORCE, rescan and replace the cached value."
+  (when force
+    (setq noteworthy-collab-typst-inputs--cache
+          (assoc-delete-all root noteworthy-collab-typst-inputs--cache)))
+  (or (cdr (assoc root noteworthy-collab-typst-inputs--cache))
+      (let ((v (ignore-errors (noteworthy-collab-typst-inputs root))))
+        (when v (push (cons root v) noteworthy-collab-typst-inputs--cache))
+        v)))
+
 (defun noteworthy-collab-typst-inputs (root)
   "Return the typst `--input' flags for the project at ROOT, as a list.
 
@@ -486,9 +514,12 @@ never completes a websocket handshake."
     ;; only reaches tinymist through initializationOptions, so a changed
     ;; structure means restarting it -- otherwise the preview renders an
     ;; outline that no longer matches the files.
-    (let ((now (ignore-errors (noteworthy-collab-typst-inputs
-                               (or (bound-and-true-p noteworthy-collab-project-root)
-                                   default-directory)))))
+    (let* ((root (or (bound-and-true-p noteworthy-collab--project-root)
+                     (bound-and-true-p noteworthy-collab-project-root)
+                     default-directory))
+           ;; FORCE: the point of getting here is to notice a structure that
+           ;; changed, so a cached answer is the one thing that cannot help.
+           (now (noteworthy-collab-typst-inputs-cached root t)))
       (when (and now noteworthy-collab-preview--inputs
                  (not (equal now noteworthy-collab-preview--inputs))
                  (not force))
@@ -571,6 +602,9 @@ restarts it and re-hosts the preview."
   (let ((buf (current-buffer)))
     (unless (and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
       (user-error "No tinymist LSP in this buffer -- open a .typ file in the project"))
+    ;; The restart is pointless if it re-sends the mapping we are restarting to
+    ;; replace: the inputs are read from the cache at initialize.
+    (noteworthy-collab-typst-inputs-invalidate)
     (message "Noteworthy: restarting tinymist to pick up the new structure...")
     (ignore-errors
       (let ((lsp--cur-workspace (noteworthy-collab-preview--tinymist-workspace)))
