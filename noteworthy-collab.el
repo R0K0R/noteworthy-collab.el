@@ -1388,8 +1388,14 @@ LEN is length of deleted text."
           (message "Noteworthy collab: not connected -- this edit was NOT sent and will be lost")
           (noteworthy-collab--log 'error "after-change: dropped edit, not connected"))
          (t
-          (let ((inserted (buffer-substring-no-properties beg end))
-                (ops '()))
+          (let* ((inserted (buffer-substring-no-properties beg end))
+                 ;; How long this buffer was *before* this change.  The room
+                 ;; checks it against its own copy and refuses the edit if they
+                 ;; differ, which is the only way a positional delta can be
+                 ;; known to mean what its offsets say.  `buffer-size' ignores
+                 ;; narrowing, and so do BEG/END, so this stays absolute.
+                 (base (+ (- (buffer-size) (- end beg)) len))
+                 (ops '()))
             ;; Build delta ops (0-indexed positions)
             ;; Each op must be an alist for proper JSON encoding
             (when (> (1- beg) 0)
@@ -1406,6 +1412,7 @@ LEN is length of deleted text."
                   (noteworthy-collab--send
                    `((type . "delta")
                      (file . ,noteworthy-collab--file-path)
+                     (base . ,base)
                      (ops . ,final-ops))))
               (noteworthy-collab--log 'info "after-change: No ops generated (inserted='%s')" inserted))))))
     (error
