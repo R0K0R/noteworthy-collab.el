@@ -910,11 +910,20 @@ throw away either."
           (widen)
           (let* ((noteworthy-collab--applying-remote t)
                  (range (noteworthy-collab--apply-ops ops)))
-            ;; Widen by one char so a pure deletion (beg == end) still
-            ;; refontifies the text that closed over the gap.
-            (when range
+            (cond
+             ;; The delta was written against text we do not have.  Applying
+             ;; any part of it corrupts the buffer, so take the room's copy.
+             ((eq range 'desync)
+              (noteworthy-collab--log
+               'error "Delta for %s does not fit this buffer; resyncing" file)
+              (message "Noteworthy collab: %s was out of sync; refetching"
+                       (buffer-name))
+              (noteworthy-collab--resync-file file))
+             ;; Widen by one char so a pure deletion (beg == end) still
+             ;; refontifies the text that closed over the gap.
+             (range
               (font-lock-flush (max (point-min) (1- (car range)))
-                               (min (point-max) (1+ (cdr range)))))))
+                               (min (point-max) (1+ (cdr range))))))))
         (noteworthy-collab--notify-preview)))))
 
 (defun noteworthy-collab--notify-preview ()
@@ -942,42 +951,65 @@ hook is not installed."
        (noteworthy-collab--log 'warn "Preview notify failed: %s"
                                (error-message-string err)))))))
 
+(defun noteworthy-collab--ops-span (ops)
+  "Total characters of the document OPS address before inserting."
+  (let ((span 0))
+    (dolist (op (if (vectorp ops) (append ops nil) ops) span)
+      (setq span (+ span
+                    (or (alist-get 'retain op) 0)
+                    (or (alist-get 'delete op) 0))))))
+
+(defun noteworthy-collab--resync-file (file)
+  "Ask the server for FILE's authoritative text.
+Re-joining is the resync: the bridge answers a join by attaching the room
+and sending its content as a `sync\=', which `noteworthy-collab--apply-sync\='
+installs (stashing anything local it would otherwise discard)."
+  (when file
+    (noteworthy-collab--send `((type . "join") (file . ,file)))))
+
 (defun noteworthy-collab--apply-ops (ops)
-  "Apply delta OPS to current buffer with bounds checking.
+  "Apply delta OPS to the current buffer.
 OPS is a vector/list of operations like:
   [{\"retain\": 10}, {\"insert\": \"hello\"}, {\"delete\": 5}]
 
-Return (BEG . END) covering the text actually touched, or nil if nothing
-changed.  Callers use it to scope refontification."
-  (let (beg end)
-    (save-excursion
-      (goto-char (point-min))
-      (let ((ops-list (if (vectorp ops) (append ops nil) ops)))
-        (dolist (op ops-list)
-          (condition-case err
+Return (BEG . END) covering the text actually touched, nil if nothing
+changed, or the symbol `desync\=' when the ops do not fit this buffer.
+
+Positions are the sender\='s, so they only mean anything if both sides hold
+the same text.  This used to clamp a retain or a delete to what was left
+(`(min count remaining)\='), which silently turned that disagreement into
+damage: the retain stopped short, the insert landed wherever point had
+got to -- routinely mid-word -- and the buffer ended up spliced together
+out of two different documents.  What it looks like from the outside is
+syntax highlighting gone haywire, because the text really is malformed.
+Refuse instead, and let the caller ask for the authoritative copy."
+  (if (> (noteworthy-collab--ops-span ops) (- (point-max) (point-min)))
+      'desync
+    (let (beg end)
+      (save-excursion
+        (goto-char (point-min))
+        (condition-case err
+            (dolist (op (if (vectorp ops) (append ops nil) ops))
               (cond
                ((alist-get 'retain op)
-                (let ((count (alist-get 'retain op))
-                      (remaining (- (point-max) (point))))
-                  ;; Clamp retain to remaining buffer
-                  (forward-char (min count remaining))))
+                (forward-char (alist-get 'retain op)))
                ((alist-get 'insert op)
                 (let ((start (point)))
                   (insert (alist-get 'insert op))
                   (setq beg (min (or beg start) start)
                         end (max (or end (point)) (point)))))
                ((alist-get 'delete op)
-                (let* ((count (alist-get 'delete op))
-                       (remaining (- (point-max) (point)))
-                       (start (point)))
-                  ;; Clamp delete to remaining buffer
-                  (delete-char (min count remaining))
+                (let ((start (point)))
+                  (delete-char (alist-get 'delete op))
                   (setq beg (min (or beg start) start)
-                        end (max (or end start) start)))))
-            (error
-             (noteworthy-collab--log 'warn "Op error: %s (op: %s)" err op))))))
-    (when (and beg end)
-      (cons beg end))))
+                        end (max (or end start) start))))))
+          (error
+           ;; Half-applied is its own kind of desync -- do not paper over it.
+           (noteworthy-collab--log 'error "Op failed mid-delta: %s"
+                                   (error-message-string err))
+           (setq beg 'desync))))
+      (cond ((eq beg 'desync) 'desync)
+            ((and beg end) (cons beg end))))))
 
 (defun noteworthy-collab--show-cursor (msg)
   "Show remote user's cursor and selection.
