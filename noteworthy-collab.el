@@ -1827,14 +1827,25 @@ prefix argument, also drops the TRAMP connection."
   (when (process-live-p (bound-and-true-p noteworthy-collab-preview--tunnel-process))
     (delete-process noteworthy-collab-preview--tunnel-process)
     (setq noteworthy-collab-preview--tunnel-process nil))
-  ;; 5. session buffers, including the xwidget -- that is a live WebKit process
-  (dolist (buf (buffer-list))
-    (let ((name (buffer-name buf)))
-      (when (or (string-match-p "xwidget-webkit" name)
-                (member name (list noteworthy-collab-log-buffer
-                                   noteworthy-collab-chat-buffer
-                                   "*noteworthy-terminal*")))
-        (ignore-errors (kill-buffer buf)))))
+  ;; 5. session buffers, including the xwidget -- that is a live WebKit process.
+  ;;
+  ;; Under the same guard the setup path uses, because tearing a layout down
+  ;; is not a layout preference: killing the xwidget closes its window, the
+  ;; remaining panes take the space, and the size tracker wrote that down --
+  ;; so the PDF pane came back wider on every session, a little more each
+  ;; time.  A save queued before we got here would still fire afterwards with
+  ;; the widened numbers, so drop it too.
+  (let ((noteworthy-collab--building-layout t))
+    (dolist (buf (buffer-list))
+      (let ((name (buffer-name buf)))
+        (when (or (string-match-p "xwidget-webkit" name)
+                  (member name (list noteworthy-collab-log-buffer
+                                     noteworthy-collab-chat-buffer
+                                     "*noteworthy-terminal*")))
+          (ignore-errors (kill-buffer buf)))))
+    (when (timerp (bound-and-true-p noteworthy-collab--save-settings-timer))
+      (cancel-timer noteworthy-collab--save-settings-timer)
+      (setq noteworthy-collab--save-settings-timer nil)))
   (when cleanup-tramp
     (ignore-errors (tramp-cleanup-all-connections)))
   (message "Noteworthy collab: session ended%s"
