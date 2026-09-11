@@ -153,7 +153,27 @@ data plane; scrolling goes through `tinymist.scrollPreview' instead."
 (defvar noteworthy-collab-preview--inputs nil
   "Chapter/page mapping the running language server was started with.
 The mapping travels in initializationOptions and is only read once, so a
-chapter or page added since then is invisible until the server restarts.")
+chapter or page added since then is invisible until the server restarts.
+
+Recorded when the server initializes, not when `preview-start\=' last
+looked.  Tracking the latter meant the first `preview-start\=' of a session
+found this nil, skipped the comparison, and stored the *current*
+structure -- so a page added before that first call could never be
+noticed, and every later call then agreed with itself that nothing had
+changed.")
+
+(defun noteworthy-collab-preview--record-inputs ()
+  "Remember the mapping the language server was just handed.
+
+The cache is what `initializationOptions\=' read a moment earlier, so it is
+what tinymist now holds -- the only thing worth comparing a rescan
+against."
+  (when-let* ((root (or (bound-and-true-p noteworthy-collab--project-root)
+                        (bound-and-true-p noteworthy-collab-project-root))))
+    (setq noteworthy-collab-preview--inputs
+          (ignore-errors (noteworthy-collab-typst-inputs-cached root)))))
+
+(add-hook 'lsp-after-initialize-hook #'noteworthy-collab-preview--record-inputs)
 
 (defun noteworthy-collab-preview--tunnel-target ()
   "Return the host to tunnel to, or nil."
@@ -520,7 +540,9 @@ never completes a websocket handshake."
            ;; FORCE: the point of getting here is to notice a structure that
            ;; changed, so a cached answer is the one thing that cannot help.
            (now (noteworthy-collab-typst-inputs-cached root t)))
-      (when (and now noteworthy-collab-preview--inputs
+      ;; A nil recorded value means we do not know what the server holds --
+      ;; a reason to refresh, not to skip the check.
+      (when (and now
                  (not (equal now noteworthy-collab-preview--inputs))
                  (not force))
         (setq noteworthy-collab-preview--inputs now)
