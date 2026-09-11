@@ -1267,6 +1267,28 @@ buffer's recorded modtime goes stale constantly."
         (ignore-errors (set-visited-file-modtime))
         (set-buffer-modified-p nil)))))
 
+(defun noteworthy-collab--mark-collab-buffers-saved (&rest _)
+  "Tell Emacs collab buffers need no saving, before it asks.
+
+The room owns the file and rewrites it within a debounce of every edit, so
+there is nothing here for Emacs to write.  Its modified flag is cleared by
+`noteworthy-collab--refresh-modtime\=', but that runs on an idle timer, so
+quitting straight after typing beats it -- and then Emacs asks, and
+answering yes writes the buffer over a file the server is authoritative
+for.
+
+Only while connected.  A disconnected session is not sending edits
+anywhere, so the question is a real one and Emacs should still ask it."
+  (when (noteworthy-collab-connected-p)
+    (dolist (buf (buffer-list))
+      (with-current-buffer buf
+        (when (and (bound-and-true-p noteworthy-collab--active)
+                   (bound-and-true-p noteworthy-collab--file-path)
+                   buffer-file-name)
+          (noteworthy-collab--refresh-modtime buf))))))
+
+(advice-add 'save-some-buffers :before #'noteworthy-collab--mark-collab-buffers-saved)
+
 (defun noteworthy-collab--supersession-advice (orig-fn filename)
   "Skip the \"changed on disk, discard your edits?\" prompt in collab buffers.
 
