@@ -356,7 +356,12 @@ MSG contains userId, name, color, text, timestamp."
   (interactive "sChat: ")
   (when (not (string-empty-p message))
     (unless (noteworthy-collab--send
+             ;; Milliseconds, the wire format the web client uses.  Sending
+             ;; none meant the hub stamped it 0, and epoch 0 rendered in a
+             ;; UTC+9 locale is 09:00:00 -- a real-looking time on every line
+             ;; this client sent.
              `((type . "chat")
+               (timestamp . ,(round (* 1000 (float-time))))
                (message . ,message)))
       (message "Noteworthy collab: chat message not sent -- not connected to server"))))
 
