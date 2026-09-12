@@ -815,6 +815,40 @@ throw away either."
                              (error-message-string err))
      nil)))
 
+(defun noteworthy-collab--remap-position (pos old new)
+  "Where buffer position POS in OLD text lands in NEW text.
+
+A sync replaces the buffer wholesale, and putting the cursor back at the
+same character offset is only right when the text did not change -- which
+is the one case where it did not matter.  Wherever the server's copy
+differs before the cursor, that offset denotes a different place: a few
+characters out, mid-word, or paragraphs away if the difference was large.
+
+Mapped through the same common prefix and suffix the bridge uses to build
+a delta, so a cursor before the change stays where it was, one after it
+moves with the text, and one inside the replaced region lands at the end
+of whatever replaced it."
+  (let* ((old (or old "")) (new (or new ""))
+         (lo (length old)) (ln (length new))
+         (i (max 0 (min (1- pos) lo)))       ; buffer position -> string index
+         (cap (min lo ln))
+         (prefix 0))
+    (while (and (< prefix cap) (eq (aref old prefix) (aref new prefix)))
+      (setq prefix (1+ prefix)))
+    (let ((suffix 0)
+          (room (- cap prefix)))
+      (while (and (< suffix room)
+                  (eq (aref old (- lo suffix 1)) (aref new (- ln suffix 1))))
+        (setq suffix (1+ suffix)))
+      (1+ (cond
+           ;; Before anything that changed: the offset still means this.
+           ((<= i prefix) i)
+           ;; After everything that changed: carried along by the difference.
+           ((>= i (- lo suffix)) (+ i (- ln lo)))
+           ;; Inside the replaced span -- there is no corresponding position,
+           ;; so sit at the end of what replaced it rather than guess.
+           (t (max prefix (- ln suffix))))))))
+
 (defun noteworthy-collab--apply-sync (msg)
   "Apply full sync from server."
   (let* ((file (alist-get 'file msg))
@@ -855,24 +889,32 @@ throw away either."
         ;; that's temporary and the user's own narrowing survives the sync.
         (save-restriction
           (widen)
-          (let ((noteworthy-collab--applying-remote t)
-                ;; Buffers can be forced read-only while disconnected (see
-                ;; `noteworthy-collab--mark-buffers-read-only') or already be
-                ;; read-only on their own; either way the sync itself must go
-                ;; through.
-                (inhibit-read-only t)
-                (pos (point))
-                (window-points (mapcar (lambda (w) (cons w (window-point w)))
-                                       (get-buffer-window-list buf nil t))))
+          (let* ((noteworthy-collab--applying-remote t)
+                 ;; Buffers can be forced read-only while disconnected (see
+                 ;; `noteworthy-collab--mark-buffers-read-only') or already be
+                 ;; read-only on their own; either way the sync itself must go
+                 ;; through.
+                 (inhibit-read-only t)
+                 ;; Read after `widen', so the mapping covers the whole buffer
+                 ;; rather than whatever the user had narrowed to.
+                 (before (buffer-substring-no-properties (point-min) (point-max)))
+                 (pos (point))
+                 (window-points (mapcar (lambda (w) (cons w (window-point w)))
+                                        (get-buffer-window-list buf nil t))))
             (erase-buffer)
             (insert content)
             (setq noteworthy-collab--version version)
-            ;; Try to restore position, in this window and every other window
-            ;; showing the buffer.
-            (goto-char (min pos (point-max)))
+            ;; Put the cursor back where it was pointing, not back at the
+            ;; number it happened to be.  Same for every other window showing
+            ;; this buffer.
+            (goto-char (min (noteworthy-collab--remap-position pos before content)
+                            (point-max)))
             (dolist (wp window-points)
               (when (window-live-p (car wp))
-                (set-window-point (car wp) (min (cdr wp) (point-max)))))))
+                (set-window-point
+                 (car wp)
+                 (min (noteworthy-collab--remap-position (cdr wp) before content)
+                      (point-max)))))))
         ;; This sync is authoritative content: whatever read-only state we
         ;; imposed while disconnected (or the user's own, if that's what we
         ;; saved) can now be restored, and it's safe to let local edits
