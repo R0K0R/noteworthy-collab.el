@@ -899,22 +899,30 @@ of whatever replaced it."
                  ;; rather than whatever the user had narrowed to.
                  (before (buffer-substring-no-properties (point-min) (point-max)))
                  (pos (point))
-                 (window-points (mapcar (lambda (w) (cons w (window-point w)))
-                                        (get-buffer-window-list buf nil t))))
+                 ;; Point and scroll position, for every window showing this
+                 ;; buffer on any frame.
+                 (views (mapcar (lambda (w)
+                                  (list w (window-point w) (window-start w)))
+                                (get-buffer-window-list buf nil t))))
             (erase-buffer)
             (insert content)
             (setq noteworthy-collab--version version)
-            ;; Put the cursor back where it was pointing, not back at the
-            ;; number it happened to be.  Same for every other window showing
-            ;; this buffer.
-            (goto-char (min (noteworthy-collab--remap-position pos before content)
-                            (point-max)))
-            (dolist (wp window-points)
-              (when (window-live-p (car wp))
-                (set-window-point
-                 (car wp)
-                 (min (noteworthy-collab--remap-position (cdr wp) before content)
-                      (point-max)))))))
+            (cl-flet ((where (p) (min (noteworthy-collab--remap-position
+                                       p before content)
+                                      (point-max))))
+              ;; Put the cursor back where it was pointing, not back at the
+              ;; number it happened to be.
+              (goto-char (where pos))
+              (dolist (v views)
+                (when (window-live-p (nth 0 v))
+                  (set-window-point (nth 0 v) (where (nth 1 v)))
+                  ;; And the scroll position: `erase-buffer' collapses
+                  ;; `window-start', so without this the text jumps under the
+                  ;; cursor even when the cursor itself came back correctly --
+                  ;; which from the chair is indistinguishable from the cursor
+                  ;; having moved.  NOFORCE so redisplay may still adjust if
+                  ;; point would land off-screen.
+                  (set-window-start (nth 0 v) (where (nth 2 v)) t))))))
         ;; This sync is authoritative content: whatever read-only state we
         ;; imposed while disconnected (or the user's own, if that's what we
         ;; saved) can now be restored, and it's safe to let local edits
