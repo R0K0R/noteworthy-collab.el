@@ -565,11 +565,7 @@ the return value and report failure -- this function only logs to the
        (noteworthy-collab--log 'info "Joined as %s (color: %s)"
                                noteworthy-collab--user-id
                                noteworthy-collab--user-color)
-       ;; Rejoin current file if any
-       (dolist (buf (buffer-list))
-         (with-current-buffer buf
-           (when (and noteworthy-collab--active noteworthy-collab--file-path)
-             (noteworthy-collab--join-file-internal noteworthy-collab--file-path)))))
+       (noteworthy-collab--join-editing-file "welcome"))
       
       ("ack"
        ;; That edit is in the room now, so the server's deltas account for it
@@ -617,20 +613,42 @@ the return value and report failure -- this function only logs to the
           "[Server] %s" message)
          (noteworthy-collab--maybe-recover-yjs-tunnel message))))))
 
+(defun noteworthy-collab--join-editing-file (&optional reason)
+  "Join the one file the bridge can actually be attached to.
+
+The bridge holds a single tunnel, so joining every open buffer never
+attached more than one of them: each join replaced the last, the file you
+were typing in usually was not the winner, and every buffer that lost had
+its synced flag cleared and then silently dropped what you typed into it.
+
+Joins the current buffer when it is a collaborative one, otherwise the most
+recently used buffer that is.  The others are reached on demand -- an edit
+in one makes the bridge switch the tunnel to it and send that buffer its
+own sync."
+  (when (noteworthy-collab-connected-p)
+    (let ((target (or (and (bound-and-true-p noteworthy-collab--active)
+                           noteworthy-collab--file-path
+                           (current-buffer))
+                      (seq-find (lambda (b)
+                                  (with-current-buffer b
+                                    (and (bound-and-true-p noteworthy-collab--active)
+                                         noteworthy-collab--file-path)))
+                                (buffer-list)))))
+      (when target
+        (with-current-buffer target
+          (noteworthy-collab--log 'info "Joining %s (%s)"
+                                  noteworthy-collab--file-path
+                                  (or reason "connect"))
+          (noteworthy-collab--join-file-internal noteworthy-collab--file-path))))))
+
 (defun noteworthy-collab--rejoin-active-files (&optional reason)
-  "Rejoin all active file sessions.
+  "Rejoin the file session the bridge can be attached to.
 REASON is an optional log message describing why rejoin was triggered."
   (when (noteworthy-collab-connected-p)
-    (let ((joined 0)
-          (seen (make-hash-table :test 'equal)))
-      (dolist (buf (buffer-list))
-        (with-current-buffer buf
-          (when (and noteworthy-collab--active
-                     noteworthy-collab--file-path
-                     (not (gethash noteworthy-collab--file-path seen)))
-            (puthash noteworthy-collab--file-path t seen)
-            (setq joined (1+ joined))
-            (noteworthy-collab--join-file-internal noteworthy-collab--file-path))))
+    ;; One file, for the reason in `noteworthy-collab--join-editing-file':
+    ;; the bridge can only be attached to one, and the losers of a multi-file
+    ;; rejoin sit unsynced and drop what you type.
+    (let ((joined (if (noteworthy-collab--join-editing-file reason) 1 0)))
       (when (> joined 0)
         (noteworthy-collab--log
          'warn
