@@ -658,8 +658,11 @@ REASON is an optional log message describing why rejoin was triggered."
 
 (defun noteworthy-collab--maybe-recover-yjs-tunnel (message)
   "Detect Yjs tunnel failures in MESSAGE and recover by rejoining files."
+  ;; The bridge rebuilds its own tunnel now and says so in these words; the
+  ;; old string it matched on never reached Emacs at all, only the bridge's
+  ;; own console, so this recovery had quietly stopped running.
   (when (and (stringp message)
-             (string-match-p "Failed to forward delta to Yjs" message))
+             (string-match-p "did not reach the room" message))
     (let ((now (float-time)))
       (when (>= (- now noteworthy-collab--last-yjs-rejoin-at)
                 noteworthy-collab-yjs-rejoin-cooldown)
@@ -1630,21 +1633,28 @@ LEN is length of deleted text."
                 (let ((final-ops (vconcat (nreverse ops))))
                   (noteworthy-collab--log 'info "SEND delta: file=%s beg=%d end=%d len=%d ops=%s"
                                           noteworthy-collab--file-path beg end len final-ops)
-                  (noteworthy-collab--send
-                   `((type . "delta")
-                     (file . ,noteworthy-collab--file-path)
-                     (base . ,base)
-                     ;; Which of the server's messages this was written
-                     ;; against, so an edit that crossed one in flight can be
-                     ;; rebased past it instead of refused.
-                     (baseRev . ,noteworthy-collab--rev)
-                     (ops . ,final-ops)))
-                  ;; The server has not seen this yet, so its next deltas will
-                  ;; be positioned as though it does not exist.
-                  (setq noteworthy-collab--pending
-                        (append noteworthy-collab--pending
-                                (list (list (1- beg) len
-                                            (length inserted) inserted)))))
+                  (if (noteworthy-collab--send
+                       `((type . "delta")
+                         (file . ,noteworthy-collab--file-path)
+                         (base . ,base)
+                         ;; Which of the server's messages this was written
+                         ;; against, so an edit that crossed one in flight can
+                         ;; be rebased past it instead of refused.
+                         (baseRev . ,noteworthy-collab--rev)
+                         (ops . ,final-ops)))
+                      ;; The server has not seen this yet, so its next deltas
+                      ;; will be positioned as though it does not exist.
+                      (setq noteworthy-collab--pending
+                            (append noteworthy-collab--pending
+                                    (list (list (1- beg) len
+                                                (length inserted) inserted))))
+                    ;; It never went out.  Recording it as outstanding would
+                    ;; have every later inbound delta moved past an edit the
+                    ;; server is never going to acknowledge.
+                    (message "Noteworthy collab: an edit was NOT sent (%s)"
+                             (buffer-name))
+                    (noteworthy-collab--log 'error "Delta send failed for %s"
+                                            noteworthy-collab--file-path)))
               (noteworthy-collab--log 'info "after-change: No ops generated (inserted='%s')" inserted))))))
     (error
      (noteworthy-collab--log 'error "after-change error: %s" (error-message-string err)))))
