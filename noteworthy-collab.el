@@ -91,6 +91,14 @@
 (defvar-local noteworthy-collab--applying-remote nil
   "Non-nil when applying remote changes (prevents echo).")
 
+(defvar-local noteworthy-collab--pending nil
+  "Local edits sent to the bridge but not yet acknowledged, oldest first.
+
+Each is (POS DELETED INSERTED-LENGTH INSERTED) in the same 0-based
+coordinates a delta uses.  The server has not seen these yet, so its own
+deltas are positioned as though they do not exist and have to be moved past
+them before they are applied.")
+
 (defvar-local noteworthy-collab--rev 0
   "Highest server revision this buffer has applied.
 
@@ -563,6 +571,16 @@ the return value and report failure -- this function only logs to the
            (when (and noteworthy-collab--active noteworthy-collab--file-path)
              (noteworthy-collab--join-file-internal noteworthy-collab--file-path)))))
       
+      ("ack"
+       ;; That edit is in the room now, so the server's deltas account for it
+       ;; and it no longer needs rebasing past.
+       (when-let* ((buf (noteworthy-collab--find-buffer-for-file
+                         (alist-get 'file msg))))
+         (with-current-buffer buf
+           (when noteworthy-collab--pending
+             (setq noteworthy-collab--pending
+                   (cdr noteworthy-collab--pending))))))
+
       ("sync"
        (noteworthy-collab--apply-sync msg))
       
@@ -890,6 +908,7 @@ of whatever replaced it."
                        (setq noteworthy-collab--version version)
                        (setq noteworthy-collab--rev
                              (or (alist-get 'rev msg) noteworthy-collab--rev))
+                       (setq noteworthy-collab--pending nil)
                        (setq noteworthy-collab--synced t)
                        (setq noteworthy-collab--sync-warned nil)
                        (noteworthy-collab--restore-read-only)
@@ -950,6 +969,9 @@ of whatever replaced it."
             (setq noteworthy-collab--version version)
             (setq noteworthy-collab--rev
                   (or (alist-get 'rev msg) noteworthy-collab--rev))
+            ;; This buffer now holds exactly the server's copy; nothing of
+            ;; ours is outstanding against it.
+            (setq noteworthy-collab--pending nil)
             (cl-flet ((where (p) (min (noteworthy-collab--remap-position
                                        p before content)
                                       (point-max))))
@@ -976,6 +998,57 @@ of whatever replaced it."
         (noteworthy-collab--notify-preview)
         (noteworthy-collab--log 'info "Synced %s (v%s, %d chars)"
                                 file version (length content))))))
+
+(defun noteworthy-collab--one-change (ops)
+  "(POS DELETED INSERTED) when OPS is a single contiguous edit, else nil."
+  (let ((pos 0) (deleted 0) (inserted "") (started nil) (ok t))
+    (dolist (op (append ops nil))
+      (cond
+       ((alist-get 'retain op)
+        (if started (setq ok nil)
+          (setq pos (+ pos (alist-get 'retain op)))))
+       ((alist-get 'delete op)
+        (setq deleted (+ deleted (alist-get 'delete op)) started t))
+       ((alist-get 'insert op)
+        (setq inserted (concat inserted (alist-get 'insert op)) started t))))
+    (and ok (list pos deleted (length inserted) inserted))))
+
+(defun noteworthy-collab--past-one (change local)
+  "CHANGE moved past LOCAL, or nil when the two touch the same characters."
+  (let ((pos (nth 0 change)) (del (nth 1 change))
+        (lpos (nth 0 local)) (ldel (nth 1 local)) (lins (nth 2 local)))
+    (cond
+     ((<= (+ lpos ldel) pos)                     ; entirely before: shift
+      (list (+ pos (- lins ldel)) del (nth 2 change) (nth 3 change)))
+     ((>= lpos (+ pos del)) change)              ; entirely after: untouched
+     (t nil))))                                  ; overlapping: no honest answer
+
+(defun noteworthy-collab--rebase-incoming (ops)
+  "OPS adjusted for local edits sent from this buffer but not yet acknowledged.
+
+The server composed OPS against a document that does not contain them yet,
+so an op positioned after one of ours lands that many characters early --
+silently, in the middle of a word.  The bridge does exactly this for our
+edits in the other direction; this is the same thing from this side.
+
+Returns the adjusted ops, or `desync\=' when no correct adjustment exists."
+  (if (null noteworthy-collab--pending)
+      ops
+    (let ((change (noteworthy-collab--one-change ops))
+          (rest noteworthy-collab--pending))
+      (if (null change)
+          'desync
+        (while (and change rest)
+          (setq change (noteworthy-collab--past-one change (car rest))
+                rest (cdr rest)))
+        (if (null change)
+            'desync
+          (let ((out '()))
+            (when (> (nth 0 change) 0) (push `((retain . ,(nth 0 change))) out))
+            (when (> (nth 1 change) 0) (push `((delete . ,(nth 1 change))) out))
+            (when (> (length (nth 3 change)) 0)
+              (push `((insert . ,(nth 3 change))) out))
+            (vconcat (nreverse out))))))))
 
 (defun noteworthy-collab--apply-delta (msg)
   "Apply delta from remote user."
@@ -1007,7 +1080,10 @@ of whatever replaced it."
         (save-restriction
           (widen)
           (let* ((noteworthy-collab--applying-remote t)
-                 (range (noteworthy-collab--apply-ops ops)))
+                 (adjusted (noteworthy-collab--rebase-incoming ops))
+                 (range (if (eq adjusted 'desync)
+                            'desync
+                          (noteworthy-collab--apply-ops adjusted))))
             (cond
              ;; The delta was written against text we do not have.  Applying
              ;; any part of it corrupts the buffer, so take the room's copy.
@@ -1544,7 +1620,13 @@ LEN is length of deleted text."
                      ;; against, so an edit that crossed one in flight can be
                      ;; rebased past it instead of refused.
                      (baseRev . ,noteworthy-collab--rev)
-                     (ops . ,final-ops))))
+                     (ops . ,final-ops)))
+                  ;; The server has not seen this yet, so its next deltas will
+                  ;; be positioned as though it does not exist.
+                  (setq noteworthy-collab--pending
+                        (append noteworthy-collab--pending
+                                (list (list (1- beg) len
+                                            (length inserted) inserted)))))
               (noteworthy-collab--log 'info "after-change: No ops generated (inserted='%s')" inserted))))))
     (error
      (noteworthy-collab--log 'error "after-change error: %s" (error-message-string err)))))
