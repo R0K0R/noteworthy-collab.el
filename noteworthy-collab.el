@@ -91,6 +91,15 @@
 (defvar-local noteworthy-collab--applying-remote nil
   "Non-nil when applying remote changes (prevents echo).")
 
+(defvar-local noteworthy-collab--rev 0
+  "Highest server revision this buffer has applied.
+
+Sent back with every edit as `baseRev\=', so the bridge knows exactly which of
+its own messages we had seen when we composed it and can rebase the edit past
+the rest.  Without it the bridge could only compare character counts, which
+cannot tell an edit that crossed ours in flight from a real divergence -- so
+it refused every edit typed while a peer was typing.")
+
 (defvar-local noteworthy-collab--version 0
   "Document version for this buffer.")
 
@@ -879,6 +888,8 @@ of whatever replaced it."
                               (or content ""))
                      (progn
                        (setq noteworthy-collab--version version)
+                       (setq noteworthy-collab--rev
+                             (or (alist-get 'rev msg) noteworthy-collab--rev))
                        (setq noteworthy-collab--synced t)
                        (setq noteworthy-collab--sync-warned nil)
                        (noteworthy-collab--restore-read-only)
@@ -937,6 +948,8 @@ of whatever replaced it."
             (erase-buffer)
             (insert content)
             (setq noteworthy-collab--version version)
+            (setq noteworthy-collab--rev
+                  (or (alist-get 'rev msg) noteworthy-collab--rev))
             (cl-flet ((where (p) (min (noteworthy-collab--remap-position
                                        p before content)
                                       (point-max))))
@@ -1008,7 +1021,14 @@ of whatever replaced it."
              ;; refontifies the text that closed over the gap.
              (range
               (font-lock-flush (max (point-min) (1- (car range)))
-                               (min (point-max) (1+ (cdr range))))))))
+                               (min (point-max) (1+ (cdr range))))))
+            ;; Only once it is applied: claiming a revision we did not manage
+            ;; to apply would have the bridge rebase later edits past ops this
+            ;; buffer never saw.
+            (unless (eq range 'desync)
+              (let ((rev (alist-get 'rev msg)))
+                (when (integerp rev)
+                  (setq noteworthy-collab--rev rev))))))
         (noteworthy-collab--notify-preview)))))
 
 (defun noteworthy-collab--notify-preview ()
@@ -1520,6 +1540,10 @@ LEN is length of deleted text."
                    `((type . "delta")
                      (file . ,noteworthy-collab--file-path)
                      (base . ,base)
+                     ;; Which of the server's messages this was written
+                     ;; against, so an edit that crossed one in flight can be
+                     ;; rebased past it instead of refused.
+                     (baseRev . ,noteworthy-collab--rev)
                      (ops . ,final-ops))))
               (noteworthy-collab--log 'info "after-change: No ops generated (inserted='%s')" inserted))))))
     (error
