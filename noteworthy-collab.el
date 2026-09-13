@@ -802,12 +802,19 @@ deltas would apply to text nobody else has; but the text is not ours to
 throw away either."
   (condition-case err
       (let* ((dir (file-name-as-directory noteworthy-collab-stash-dir))
-             (path (expand-file-name
-                    (format "%s-%s"
-                            (format-time-string "%Y%m%d-%H%M%S")
-                            (file-name-nondirectory (or file (buffer-name))))
-                    dir)))
+             (stem (format "%s-%s"
+                           (format-time-string "%Y%m%d-%H%M%S")
+                           (file-name-nondirectory (or file (buffer-name)))))
+             (path (expand-file-name stem dir)))
         (make-directory dir t)
+        ;; Second resolution is not enough: syncs have arrived seven times in
+        ;; one second, and each stash silently overwrote the last -- so the
+        ;; text this function exists to preserve was being destroyed by the
+        ;; next call.  Never clobber an existing stash.
+        (let ((n 1))
+          (while (file-exists-p path)
+            (setq path (expand-file-name (format "%s.%d" stem n) dir)
+                  n (1+ n))))
         (write-region (point-min) (point-max) path nil 'quiet)
         path)
     (error
@@ -855,7 +862,30 @@ of whatever replaced it."
          (content (alist-get 'content msg))
          (version (alist-get 'version msg))
          (buf (noteworthy-collab--find-buffer-for-file file)))
-    (when buf
+    (when (and buf
+               ;; A sync that changes nothing should cost nothing.  Rejoining
+               ;; an already-synced buffer sends one, and erasing and
+               ;; reinserting identical text is not free: it aborts active
+               ;; snippets, drops a whole-document entry into undo, moves the
+               ;; cursor and the scroll position, and re-fires every
+               ;; modification hook into the LSP and the preview.  Several of
+               ;; these have arrived per second.  Settle the bookkeeping and
+               ;; leave the buffer alone.
+               (with-current-buffer buf
+                 (if (string= (save-restriction
+                                (widen)
+                                (buffer-substring-no-properties
+                                 (point-min) (point-max)))
+                              (or content ""))
+                     (progn
+                       (setq noteworthy-collab--version version)
+                       (setq noteworthy-collab--synced t)
+                       (setq noteworthy-collab--sync-warned nil)
+                       (noteworthy-collab--restore-read-only)
+                       (noteworthy-collab--log
+                        'info "Sync for %s matched the buffer; nothing to do" file)
+                       nil)
+                   t)))
       (with-current-buffer buf
         ;; This sync is about to replace the whole buffer.  If what is here
         ;; differs from what the server sent, that text exists nowhere else --
