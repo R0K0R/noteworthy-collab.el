@@ -721,17 +721,41 @@ control plane, and the path has to be the one *that* host sees."
       (user-error "No preview to scroll -- start one, or connect with `noteworthy-collab-preview-connect'")))))
 
 ;;;###autoload
+(defun noteworthy-collab-preview--typst-preview-live-p ()
+  "Non-nil when typst-preview.el is driving a preview of its own.
+
+Checked by socket rather than by mode: `typst-preview-mode' being on says
+somebody meant to have a preview, a live master socket says there is one."
+  (or (and (boundp 'typst-preview--local-master)
+           typst-preview--local-master
+           (fboundp 'typst-preview--master-socket)
+           (typst-preview--master-socket typst-preview--local-master))
+      (and (boundp 'typst-preview--active-masters)
+           typst-preview--active-masters)))
+
 (defun noteworthy-collab-send-position ()
-  "Scroll the preview to point, whichever preview is in use.
-Falls back to `noteworthy-typst-send-position' for a local
-typst-preview.el session, which is all that command knows about."
+  "Scroll the preview to point, whichever preview is in use."
   (interactive)
-  (if (or (and (bound-and-true-p lsp-mode) (ignore-errors (lsp-workspaces)))
-          (noteworthy-collab-preview-connected-p))
-      (noteworthy-collab-preview-scroll-to-point)
-    (if (fboundp 'noteworthy-typst-send-position)
-        (call-interactively 'noteworthy-typst-send-position)
-      (user-error "No preview session to scroll"))))
+  (cond
+   ;; Our own standalone preview: we hold its control plane, so it is
+   ;; unambiguously the one on screen.
+   ((noteworthy-collab-preview-connected-p)
+    (noteworthy-collab-preview-scroll-to-point))
+   ;; typst-preview.el is driving its own session.  It has to be asked first:
+   ;; a live tinymist workspace is not evidence that tinymist is hosting the
+   ;; preview -- lsp-mode starts one for every Typst buffer -- so taking the
+   ;; LSP route here sent `tinymist.scrollPreview' for a preview tinymist has
+   ;; never heard of.  That was refused, and the typst-preview.el session was
+   ;; never told, which is why M-o did nothing under `typst-preview-mode'.
+   ((and (noteworthy-collab-preview--typst-preview-live-p)
+         (fboundp 'noteworthy-typst-send-position))
+    (call-interactively 'noteworthy-typst-send-position))
+   ;; A preview hosted by tinymist itself, which is the collab arrangement.
+   ((noteworthy-collab-preview--tinymist-workspace)
+    (noteworthy-collab-preview-scroll-to-point))
+   ((fboundp 'noteworthy-typst-send-position)
+    (call-interactively 'noteworthy-typst-send-position))
+   (t (user-error "No preview session to scroll"))))
 
 ;;;###autoload
 (cl-defun noteworthy-collab-show-tinymist-log ()
