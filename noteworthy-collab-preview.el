@@ -93,6 +93,35 @@ With FORCE, rescan and replace the cached value."
         (when v (push (cons root v) noteworthy-collab-typst-inputs--cache))
         v)))
 
+(defun noteworthy-collab-typst-input-args (root &optional force)
+  "The project inputs as separate CLI arguments, as in `--input\=' then `k=v\='.
+
+The shape `tinymist.doStartPreview' and the typst CLI take.
+
+EVERY task that compiles the template needs these.  `parser.typ' resolves
+its includes from `chapter-folders' and `page-folders', so a task started
+without them looks for content/0/0.typ and fails -- and that failure reads
+as a broken template rather than a missing argument, which is how the
+preview ran for a long time compiling nothing.  There is more than one such
+task: the language server has one, the preview is another.  Ask here rather
+than assembling them again at a new call site."
+  (or (noteworthy-collab-typst-inputs-cached root force) (list)))
+
+(defun noteworthy-collab-typst-input-flags (root &optional force)
+  "The project inputs as single arguments, each one `--input=k=v\='.
+
+The shape lsp-mode's `typstExtraArgs' takes -- the same facts as
+`noteworthy-collab-typst-input-args', written the other way."
+  (let ((pairs (noteworthy-collab-typst-input-args root force))
+        (out nil))
+    (while pairs
+      (if (and (equal (car pairs) "--input") (cadr pairs))
+          (progn (push (concat "--input=" (cadr pairs)) out)
+                 (setq pairs (cddr pairs)))
+        (push (car pairs) out)
+        (setq pairs (cdr pairs))))
+    (nreverse out)))
+
 (defun noteworthy-collab-typst-inputs (root)
   "Return the typst `--input' flags for the project at ROOT, as a list.
 
@@ -589,7 +618,7 @@ never completes a websocket handshake."
                         ;; exist.  That is the "file not found" on an include
                         ;; line behind a preview that never renders.
                         (vconcat (ignore-errors
-                                   (noteworthy-collab-typst-inputs-cached root)))
+                                   (noteworthy-collab-typst-input-args root)))
                         (vector main))))))))
       ;; Keep the whole document as the compile target; otherwise focusing a
       ;; page leaves the preview with nothing to render.
