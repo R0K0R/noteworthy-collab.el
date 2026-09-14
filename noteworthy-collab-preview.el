@@ -572,13 +572,25 @@ never completes a websocket handshake."
                 "workspace/executeCommand"
                 (list :command "tinymist.doStartPreview"
                       :arguments
-                      (vector (vector "--data-plane-host"
-                                      (format "127.0.0.1:%d" noteworthy-collab-preview-data-port)
-                                      "--control-plane-host"
-                                      (format "127.0.0.1:%d" noteworthy-collab-preview-control-port)
-                                      "--invert-colors" "never"
-                                      "--root" (directory-file-name root)
-                                      main)))))))
+                      (vector
+                       (vconcat
+                        (vector "--data-plane-host"
+                                (format "127.0.0.1:%d" noteworthy-collab-preview-data-port)
+                                "--control-plane-host"
+                                (format "127.0.0.1:%d" noteworthy-collab-preview-control-port)
+                                "--invert-colors" "never"
+                                "--root" (directory-file-name root))
+                        ;; The preview is its own compile task and inherits
+                        ;; nothing from the language server's configuration, so
+                        ;; without these it compiles the template with no
+                        ;; chapter or page mapping: `chapter-folders' and
+                        ;; `page-folders' fall back to their defaults and the
+                        ;; include resolves to content/0/0.typ, which does not
+                        ;; exist.  That is the "file not found" on an include
+                        ;; line behind a preview that never renders.
+                        (vconcat (ignore-errors
+                                   (noteworthy-collab-typst-inputs-cached root)))
+                        (vector main))))))))
       ;; Keep the whole document as the compile target; otherwise focusing a
       ;; page leaves the preview with nothing to render.
       (ignore-errors (noteworthy-collab-preview--pin-main main))
@@ -806,97 +818,84 @@ errors are visible without leaving Emacs."
         noteworthy-collab-preview--overlaid nil))
 
 
-;;; ---------------------------------------------------------------------------
-;;; Build errors, shown where the preview would be
-;;;
-;;; A preview of a document that does not compile is a blank pane: tinymist
-;;; reports "document is not ready" to its own log and nothing reaches the
-;;; screen.  The error is the thing you need at that moment, so it takes the
-;;; preview's place until it is fixed, and the preview comes back by itself.
 
-(defcustom noteworthy-collab-preview-show-errors t
-  "Whether a failing compile replaces the preview with its errors."
+;;; ---------------------------------------------------------------------------
+;;; Build errors, written into the tinymist log
+;;;
+;;; A document that does not compile gives a blank preview: tinymist reports
+;;; "compilation failed with 1 warnings and errors" to its own log and keeps
+;;; the detail to itself, so the log you actually read (`M-t p\=') says a build
+;;; failed without saying why.  These put the why next to it.
+
+(defcustom noteworthy-collab-preview-log-errors t
+  "Whether build errors are written into the tinymist log."
   :type 'boolean
   :group 'noteworthy-collab)
 
-(defconst noteworthy-collab-preview--error-buffer "*noteworthy-typst-errors*")
-
-(defvar noteworthy-collab-preview--displaced nil
-  "The buffer the preview window held before errors took it over.")
+(defvar noteworthy-collab-preview--last-errors 'unset
+  "The last error set written, so an unchanged one is not written again.")
 
 (defun noteworthy-collab-preview--diag-field (diag key fallback)
-  "Read KEY from DIAG, whichever shape lsp-mode is using."
+  "Read KEY from DIAG, whichever shape lsp-mode is storing them in."
   (cond ((hash-table-p diag) (gethash fallback diag))
         ((and (listp diag) (plist-member diag key)) (plist-get diag key))
         (t nil)))
 
 (defun noteworthy-collab-preview--errors ()
-  "Every error tinymist currently reports, as (FILE LINE MESSAGE)."
+  "Every error tinymist currently reports, as \"file:line  message\" strings.
+
+Errors only.  A warning does not stop the document rendering, so it does not
+explain a blank preview and only buries the thing that does."
   (let (out)
     (when (fboundp 'lsp-diagnostics)
       (ignore-errors
         (maphash
          (lambda (path diags)
            (dolist (d (append diags nil))
-             (let ((sev (noteworthy-collab-preview--diag-field d :severity "severity"))
-                   (msg (noteworthy-collab-preview--diag-field d :message "message"))
-                   (rng (noteworthy-collab-preview--diag-field d :range "range")))
-               ;; 1 is Error.  Warnings do not stop the document rendering, so
-               ;; they must not take the preview away from you.
-               (when (eq sev 1)
-                 (push (list (file-name-nondirectory path)
-                             (1+ (or (noteworthy-collab-preview--diag-field
-                                      (noteworthy-collab-preview--diag-field rng :start "start")
-                                      :line "line")
-                                     0))
-                             (or msg ""))
+             (when (eq 1 (noteworthy-collab-preview--diag-field d :severity "severity"))
+               (let* ((rng (noteworthy-collab-preview--diag-field d :range "range"))
+                      (st (noteworthy-collab-preview--diag-field rng :start "start"))
+                      (line (1+ (or (noteworthy-collab-preview--diag-field st :line "line") 0))))
+                 (push (format "%s:%d  %s"
+                               (file-name-nondirectory path) line
+                               (or (noteworthy-collab-preview--diag-field d :message "message")
+                                   ""))
                        out)))))
          (lsp-diagnostics))))
-    (nreverse out)))
+    (sort out #'string<)))
 
-(defun noteworthy-collab-preview--preview-window ()
-  "The window the preview lives in, if the layout made one."
-  (seq-find (lambda (w) (window-parameter w 'noteworthy-preview))
-            (window-list nil 'no-minibuffer)))
+(defun noteworthy-collab-preview--log-buffer ()
+  "The buffer `noteworthy-collab-show-tinymist-log\=' shows, if it exists."
+  (car (seq-filter (lambda (b) (string-match-p "tinymist.*stderr" (buffer-name b)))
+                   (buffer-list))))
 
-(defun noteworthy-collab-preview-report-errors ()
-  "Put the current build errors where the preview is, or take them away.
+(defun noteworthy-collab-preview-log-errors ()
+  "Write the current build errors into the tinymist log, once per change."
+  (when noteworthy-collab-preview-log-errors
+    (let ((errors (noteworthy-collab-preview--errors)))
+      (unless (equal errors noteworthy-collab-preview--last-errors)
+        (let ((was noteworthy-collab-preview--last-errors)
+              (buf (noteworthy-collab-preview--log-buffer)))
+          (setq noteworthy-collab-preview--last-errors errors)
+          (when (buffer-live-p buf)
+            (with-current-buffer buf
+              (let ((inhibit-read-only t)
+                    (at-end (and (get-buffer-window buf)
+                                 (>= (point) (point-max)))))
+                (save-excursion
+                  (goto-char (point-max))
+                  (cond
+                   (errors
+                    (insert (format "\n=== %d build error%s -- the preview cannot render ===\n"
+                                    (length errors) (if (cdr errors) "s" "")))
+                    (dolist (e errors) (insert "  " e "\n")))
+                   ;; Only worth saying when something was broken before.
+                   ((and (listp was) was)
+                    (insert "\n=== build errors cleared ===\n"))))
+                ;; Follow the tail only for a reader already at it.
+                (when at-end (goto-char (point-max)))))))))))
 
-Restores the preview as soon as the document compiles again -- the pane is
-borrowed, not claimed."
-  (when noteworthy-collab-preview-show-errors
-    (let ((errors (noteworthy-collab-preview--errors))
-          (win (noteworthy-collab-preview--preview-window)))
-      (when (window-live-p win)
-        (if errors
-            (let ((buf (get-buffer-create noteworthy-collab-preview--error-buffer)))
-              (with-current-buffer buf
-                (let ((inhibit-read-only t))
-                  (erase-buffer)
-                  (insert (format "%d build error%s -- the preview cannot render\n\n"
-                                  (length errors) (if (cdr errors) "s" "")))
-                  (dolist (e errors)
-                    (insert (format "%s:%d\n  %s\n\n" (nth 0 e) (nth 1 e) (nth 2 e)))))
-                (goto-char (point-min))
-                (special-mode))
-              (unless (eq (window-buffer win) buf)
-                (setq noteworthy-collab-preview--displaced (window-buffer win))
-                (let ((dedicated (window-dedicated-p win)))
-                  (set-window-dedicated-p win nil)
-                  (set-window-buffer win buf)
-                  (set-window-dedicated-p win dedicated))))
-          ;; Compiles again: give the pane back.
-          (when (and noteworthy-collab-preview--displaced
-                     (buffer-live-p noteworthy-collab-preview--displaced)
-                     (eq (window-buffer win)
-                         (get-buffer noteworthy-collab-preview--error-buffer)))
-            (let ((dedicated (window-dedicated-p win)))
-              (set-window-dedicated-p win nil)
-              (set-window-buffer win noteworthy-collab-preview--displaced)
-              (set-window-dedicated-p win dedicated))
-            (setq noteworthy-collab-preview--displaced nil)))))))
-
-(add-hook 'lsp-diagnostics-updated-hook #'noteworthy-collab-preview-report-errors)
+(add-hook 'lsp-diagnostics-updated-hook #'noteworthy-collab-preview-log-errors)
 
 (provide 'noteworthy-collab-preview)
 ;;; noteworthy-collab-preview.el ends here
