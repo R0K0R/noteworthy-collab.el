@@ -641,6 +641,49 @@ own sync."
                                   (or reason "connect"))
           (noteworthy-collab--join-file-internal noteworthy-collab--file-path))))))
 
+(defvar noteworthy-collab--joined-path nil
+  "The file the bridge's one tunnel is attached to, as far as we know.
+
+Not buffer-local: there is one tunnel for the whole session, and this is
+which file it points at.  Approximate by nature -- the bridge moves the
+tunnel by itself when a delta arrives for another file -- so it is only
+ever used to skip a join that would be a no-op.")
+
+(defun noteworthy-collab--follow-buffer (&rest _)
+  "Point the bridge's one tunnel at the buffer just switched to.
+
+The bridge holds a single tunnel, so only one buffer at a time is live.
+Until now nothing moved it except typing: a buffer a peer edited while you
+were in another one stayed as you left it, and switching back did not
+help, because switching is not an edit.  The only way to see the room's
+copy was to kill the buffer and open it again.
+
+Selecting a collaborative buffer now joins it, which is what makes the
+bridge attach the tunnel and send this buffer its own sync."
+  (let ((buf (window-buffer (selected-window))))
+    (when (buffer-live-p buf)
+      (with-current-buffer buf
+        (when (and (bound-and-true-p noteworthy-collab--active)
+                   noteworthy-collab--file-path
+                   (not (equal noteworthy-collab--file-path
+                               noteworthy-collab--joined-path))
+                   (noteworthy-collab-connected-p))
+          (noteworthy-collab--log
+           'info "Following switch to %s (tunnel was on %s)"
+           noteworthy-collab--file-path
+           (or noteworthy-collab--joined-path "nothing"))
+          (condition-case err
+              (noteworthy-collab--join-file-internal noteworthy-collab--file-path)
+            (error
+             (noteworthy-collab--log 'error "Follow-switch join failed: %s"
+                                     (error-message-string err)))))))))
+
+;; Both: one fires when a window shows a different buffer, the other when a
+;; different window is selected.  `add-hook' is idempotent for a symbol, so
+;; reloading this file does not stack them.
+(add-hook 'window-buffer-change-functions #'noteworthy-collab--follow-buffer)
+(add-hook 'window-selection-change-functions #'noteworthy-collab--follow-buffer)
+
 (defun noteworthy-collab--rejoin-active-files (&optional reason)
   "Rejoin the file session the bridge can be attached to.
 REASON is an optional log message describing why rejoin was triggered."
@@ -1644,6 +1687,11 @@ LEN is length of deleted text."
                          (ops . ,final-ops)))
                       ;; The server has not seen this yet, so its next deltas
                       ;; will be positioned as though it does not exist.
+                      ;; A delta for another file makes the bridge move the
+                      ;; tunnel to it, so this buffer is the attached one now
+                      ;; whether or not it was a moment ago.
+                      (setq noteworthy-collab--joined-path
+                            noteworthy-collab--file-path)
                       (setq noteworthy-collab--pending
                             (append noteworthy-collab--pending
                                     (list (list (1- beg) len
@@ -1722,7 +1770,11 @@ LEN is length of deleted text."
   "Internal: Send join message for FILE-PATH.
 Every join or rejoin passes through here, so this is where we clear
 `noteworthy-collab--synced': the buffer isn't trustworthy again until the
-matching \"sync\" arrives and `noteworthy-collab--apply-sync' sets it."
+matching \"sync\" arrives and `noteworthy-collab--apply-sync' sets it.
+
+Also where `noteworthy-collab--joined-path' is recorded, since this is the
+one place the tunnel is asked to move."
+  (setq noteworthy-collab--joined-path file-path)
   (setq noteworthy-collab--synced nil)
   (setq noteworthy-collab--sync-warned nil)
   (unless (noteworthy-collab--send
@@ -1752,6 +1804,8 @@ matching \"sync\" arrives and `noteworthy-collab--apply-sync' sets it."
        `((type . "leave")
          (file . ,noteworthy-collab--file-path))))
     (noteworthy-collab--log 'info "Left: %s" noteworthy-collab--file-path)
+    (when (equal noteworthy-collab--joined-path noteworthy-collab--file-path)
+      (setq noteworthy-collab--joined-path nil))
     (noteworthy-collab--teardown-buffer)
     (setq-local noteworthy-collab--file-path nil)))
 
