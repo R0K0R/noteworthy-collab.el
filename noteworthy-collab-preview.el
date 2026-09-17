@@ -608,6 +608,13 @@ never completes a websocket handshake."
                                 "--control-plane-host"
                                 (format "127.0.0.1:%d" noteworthy-collab-preview-control-port)
                                 "--invert-colors" "never"
+                                ;; Render only what is on screen.  The whole
+                                ;; book is one compile target here, so without
+                                ;; this the page holds every page's SVG at
+                                ;; once and WebKit relayouts all of it on each
+                                ;; frame -- which is most of what makes the
+                                ;; xwidget preview lag while typing.
+                                "--partial-rendering" "true"
                                 "--root" (directory-file-name root))
                         ;; The preview is its own compile task and inherits
                         ;; nothing from the language server's configuration, so
