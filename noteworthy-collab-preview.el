@@ -256,6 +256,24 @@ hostname loads the page and never streams the document."
   :type 'string
   :group 'noteworthy-collab)
 
+(defcustom noteworthy-collab-preview-partial-rendering nil
+  "Whether to ask tinymist to render only the visible part of the document.
+
+Off, though it is the cure for the lag it was added for.  The whole book is
+one compile target here, so without it the page holds every page's SVG at
+once and WebKit relays all of it out on each frame -- which is most of what
+makes typing beside the preview stutter.
+
+With it on, this tinymist draws the document's LAST page at the top of the
+viewport, oversized, over the first page and part of the second.  Upstream
+calls the flag experimental; the same artifact appears under plain
+`typst-preview-mode', so it is the viewer's and not ours.
+
+Turn it on if a page of your document is big enough that the lag costs more
+than the artifact, and turn it off again when tinymist has moved on."
+  :type 'boolean
+  :group 'noteworthy-collab)
+
 (defcustom noteworthy-collab-preview-auto-repaint t
   "Whether to force the preview xwidget to repaint after edits.
 Emacs only redraws an xwidget when something touches its window, so a
@@ -608,14 +626,13 @@ never completes a websocket handshake."
                                 "--control-plane-host"
                                 (format "127.0.0.1:%d" noteworthy-collab-preview-control-port)
                                 "--invert-colors" "never"
-                                ;; Render only what is on screen.  The whole
-                                ;; book is one compile target here, so without
-                                ;; this the page holds every page's SVG at
-                                ;; once and WebKit relayouts all of it on each
-                                ;; frame -- which is most of what makes the
-                                ;; xwidget preview lag while typing.
-                                "--partial-rendering" "true"
                                 "--root" (directory-file-name root))
+                        ;; Off unless asked for: it cures the lag and draws
+                        ;; the last page over the first.  See
+                        ;; `noteworthy-collab-preview-partial-rendering'.
+                        (if noteworthy-collab-preview-partial-rendering
+                            (vector "--partial-rendering" "true")
+                          (vector))
                         ;; The preview is its own compile task and inherits
                         ;; nothing from the language server's configuration, so
                         ;; without these it compiles the template with no
