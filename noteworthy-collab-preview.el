@@ -548,6 +548,38 @@ so the two do not each run a timer."
                                            noteworthy-collab-project-root)))))
     (and master (or (file-remote-p master 'localname) master))))
 
+(defun noteworthy-collab-preview-url ()
+  "The URL the preview page is served at."
+  (format "http://localhost:%d/" noteworthy-collab-preview-data-port))
+
+;;;###autoload
+(defun noteworthy-collab-preview-open-external ()
+  "Open the preview in the system browser rather than the xwidget.
+
+Worth doing for a document big enough that the xwidget stutters, because
+the two are not asked to do the same work.
+
+A browser composites the page itself, on the GPU, against its own vsync,
+in its own process.  `xwidget-webkit\=' renders OFFSCREEN: WebKit paints,
+Emacs reads the pixels back and blits them, and Emacs only does that when
+something touches the window -- which is why this package has to nudge it
+on a timer at all.  Every frame therefore costs a readback and a redisplay,
+on Emacs\='s single thread, the same one taking your keystrokes.
+
+The engine is old as well.  Emacs xwidgets pin webkitgtk 2.38 -- 2022 --
+because that is the ABI they build against, so the preview runs on an
+engine years behind the one Firefox brings, which is also why
+`noteworthy-collab-preview-partial-rendering\=' corrupts the first screen
+here and not there.
+
+Scroll sync is not lost: the page talks to tinymist over the data plane,
+and tinymist forwards what Emacs sends over the control plane, so an
+external browser follows the cursor exactly as the xwidget does."
+  (interactive)
+  (let ((url (noteworthy-collab-preview-url)))
+    (browse-url url)
+    (message "Preview opened in the browser: %s" url)))
+
 (defun noteworthy-collab-preview--page-alive-p ()
   "Return non-nil if a preview is already answering on the data port."
   (let ((url (format "http://localhost:%d/" noteworthy-collab-preview-data-port)))
