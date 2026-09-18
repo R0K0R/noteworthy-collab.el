@@ -262,14 +262,11 @@ hostname loads the page and never streams the document."
 On.  The whole book is one compile target here, so without it the page holds
 every page's SVG at once and the engine relays all of it out on each frame.
 
-It used to draw the document's last page over the first, oversized, which is
-why this was off.  That was not the flag's fault: the viewer measures its
-container when it first renders, and an xwidget has no size yet at that
-point, so the scale fell back to 1 and the viewport rect it computed picked
-a page from nowhere near the cursor.  See
-`noteworthy-collab-preview-remeasure', which tells the page to measure again
-once the widget has been allocated.  Chrome and Firefox never showed the
-artifact because a browser tab has a size before the first render."
+It used to draw the document's last page over the first, oversized, in the
+xwidget only.  That is a WebKitGTK paint bug with the canvas placeholders
+partial rendering uses for far pages -- see
+`noteworthy-collab-preview--webkit-fix-css', which is injected into the page
+after it loads and cures it."
   :type 'boolean
   :group 'noteworthy-collab)
 
@@ -556,6 +553,39 @@ takes depends on the frame."
   :type '(repeat number)
   :group 'noteworthy-collab)
 
+(defconst noteworthy-collab-preview--webkit-fix-css
+  "foreignObject.typst-svg-mixin-canvas { visibility: hidden; }"
+  "Hide the canvas placeholders partial rendering uses for far pages.
+
+With partial rendering on, a page outside the viewport is not drawn as SVG
+but as a `<foreignObject class=\"typst-svg-mixin-canvas\">' holding a
+`<canvas>', inside the page's transformed `<g>'.  WebKitGTK paints such a
+foreignObject ignoring the ancestor transform: at the SVG origin, at the
+canvas's own size.  Every far page therefore paints over the first one, and
+the last painted wins -- which is the document's last page, oversized, at
+the top.  They render lazily, so it shows up a few seconds in.  Chrome and
+Firefox apply the transform and never show it.
+
+The DOM is correct throughout; only the paint is wrong, so the fix is to
+keep those placeholders out of the paint.  A far page then has no
+low-resolution stand-in until it scrolls into view and is drawn as SVG,
+which is no loss anyone will notice.  Giving the canvas its own compositing
+layer, or `will-change' on the groups, was tried and does not help.")
+
+(defun noteworthy-collab-preview-inject-webkit-fix ()
+  "Put `noteworthy-collab-preview--webkit-fix-css' into the preview page.
+Idempotent: the rule lives in a `<style id=nw-webkit-fix>' in `<head>', so
+it survives the viewer replacing the document and is added once."
+  (interactive)
+  (dolist (pair (noteworthy-collab-preview--xwidget-windows))
+    (with-current-buffer (car pair)
+      (let ((xw (ignore-errors (xwidget-webkit-current-session))))
+        (when xw
+          (ignore-errors
+            (xwidget-webkit-execute-script
+             xw (format "(function(){if(document.getElementById('nw-webkit-fix'))return;var s=document.createElement('style');s.id='nw-webkit-fix';s.textContent=%S;document.head.appendChild(s);})();"
+                        noteworthy-collab-preview--webkit-fix-css))))))))
+
 (defun noteworthy-collab-preview-remeasure ()
   "Tell the preview page to measure its container again.
 
@@ -587,8 +617,12 @@ something to measure."
              xw "window.dispatchEvent(new Event('resize'));")))))))
 
 (defun noteworthy-collab-preview--schedule-remeasure ()
-  "Re-measure the preview once the xwidget has a size to measure."
+  "After the page loads: inject the WebKit fix, and re-measure.
+The fix is what cures the stray last page; the re-measure is kept because a
+container measured at zero width is still a wrong scale, even if it turned
+out not to be this bug."
   (dolist (delay noteworthy-collab-preview-settle-delays)
+    (run-with-timer delay nil #'noteworthy-collab-preview-inject-webkit-fix)
     (run-with-timer delay nil #'noteworthy-collab-preview-remeasure)))
 
 (defun noteworthy-collab-preview-url ()
