@@ -256,21 +256,20 @@ hostname loads the page and never streams the document."
   :type 'string
   :group 'noteworthy-collab)
 
-(defcustom noteworthy-collab-preview-partial-rendering nil
+(defcustom noteworthy-collab-preview-partial-rendering t
   "Whether to ask tinymist to render only the visible part of the document.
 
-Off, though it is the cure for the lag it was added for.  The whole book is
-one compile target here, so without it the page holds every page's SVG at
-once and WebKit relays all of it out on each frame -- which is most of what
-makes typing beside the preview stutter.
+On.  The whole book is one compile target here, so without it the page holds
+every page's SVG at once and the engine relays all of it out on each frame.
 
-With it on, this tinymist draws the document's LAST page at the top of the
-viewport, oversized, over the first page and part of the second.  Upstream
-calls the flag experimental; the same artifact appears under plain
-`typst-preview-mode', so it is the viewer's and not ours.
-
-Turn it on if a page of your document is big enough that the lag costs more
-than the artifact, and turn it off again when tinymist has moved on."
+It used to draw the document's last page over the first, oversized, which is
+why this was off.  That was not the flag's fault: the viewer measures its
+container when it first renders, and an xwidget has no size yet at that
+point, so the scale fell back to 1 and the viewport rect it computed picked
+a page from nowhere near the cursor.  See
+`noteworthy-collab-preview-remeasure', which tells the page to measure again
+once the widget has been allocated.  Chrome and Firefox never showed the
+artifact because a browser tab has a size before the first render."
   :type 'boolean
   :group 'noteworthy-collab)
 
@@ -547,6 +546,50 @@ so the two do not each run a timer."
                          (expand-file-name "templates/core/parser.typ"
                                            noteworthy-collab-project-root)))))
     (and master (or (file-remote-p master 'localname) master))))
+
+(defcustom noteworthy-collab-preview-settle-delays '(0.4 1.2 2.5)
+  "When to tell the preview page to measure itself again, after loading.
+
+Seconds after the page is loaded into the xwidget.  Several, because what
+is being waited for is the widget getting its real size, and how long that
+takes depends on the frame."
+  :type '(repeat number)
+  :group 'noteworthy-collab)
+
+(defun noteworthy-collab-preview-remeasure ()
+  "Tell the preview page to measure its container again.
+
+The reason this is needed at all, and only here:
+
+  statSvgFromDom() {
+    const { width: containerWidth, ... } = this.cachedDOMState;
+    const computedRevScale = containerWidth ? this.docWidth / containerWidth : 1;
+
+`cachedDOMState\=' starts at `{width: 0, height: 0}\=', and the viewer measures
+its container when it first renders.  A browser tab has a size by then.  An
+xwidget is created and only afterwards allocated, so the first render can
+happen at zero width -- and then that ternary quietly falls back to a scale
+of 1 instead of `docWidth / containerWidth\=', which is why a page comes out
+oversized, and the viewport rect it computes alongside picks a page from
+nowhere near where you are.  That is the duplicated last page at the top.
+
+The viewer recomputes on `window resize\=' (`fromEvent(window, \"resize\")\='
+-> `addViewportChange()\='), and it never listens for anything else, so a
+synthetic resize is the whole fix: measure again, now that there is
+something to measure."
+  (interactive)
+  (dolist (pair (noteworthy-collab-preview--xwidget-windows))
+    (with-current-buffer (car pair)
+      (let ((xw (ignore-errors (xwidget-webkit-current-session))))
+        (when xw
+          (ignore-errors
+            (xwidget-webkit-execute-script
+             xw "window.dispatchEvent(new Event('resize'));")))))))
+
+(defun noteworthy-collab-preview--schedule-remeasure ()
+  "Re-measure the preview once the xwidget has a size to measure."
+  (dolist (delay noteworthy-collab-preview-settle-delays)
+    (run-with-timer delay nil #'noteworthy-collab-preview-remeasure)))
 
 (defun noteworthy-collab-preview-url ()
   "The URL the preview page is served at."

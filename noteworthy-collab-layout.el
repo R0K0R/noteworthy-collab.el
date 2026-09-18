@@ -126,7 +126,13 @@ If `noteworthy-collab-preview-url` is nil, creates a placeholder buffer."
       (when (fboundp 'noteworthy-collab-preview-ensure-repaint)
         (noteworthy-collab-preview-ensure-repaint))
       (if (and noteworthy-collab-preview-url (featurep 'xwidget-internal))
-          (xwidget-webkit-browse-url noteworthy-collab-preview-url)
+          (progn
+            (xwidget-webkit-browse-url noteworthy-collab-preview-url)
+            ;; The page measures its container when it first renders, and the
+            ;; widget has no size yet.  See
+            ;; `noteworthy-collab-preview-remeasure'.
+            (when (fboundp 'noteworthy-collab-preview--schedule-remeasure)
+              (noteworthy-collab-preview--schedule-remeasure)))
         ;; Placeholder buffer if URL not ready
         (let ((buf (get-buffer-create "*noteworthy-preview-placeholder*")))
           (with-current-buffer buf
@@ -144,7 +150,9 @@ If `noteworthy-collab-preview-url` is nil, creates a placeholder buffer."
   (when (and noteworthy-collab-preview-url (featurep 'xwidget-internal))
     (when-let ((win (cl-find-if (lambda (w) (window-parameter w 'noteworthy-preview)) (window-list))))
       (select-window win)
-      (xwidget-webkit-browse-url noteworthy-collab-preview-url))))
+      (xwidget-webkit-browse-url noteworthy-collab-preview-url)
+      (when (fboundp 'noteworthy-collab-preview--schedule-remeasure)
+        (noteworthy-collab-preview--schedule-remeasure)))))
 
 ;;; ============================================================
 ;;; Main Layout Initialization
