@@ -553,38 +553,24 @@ takes depends on the frame."
   :type '(repeat number)
   :group 'noteworthy-collab)
 
-(defconst noteworthy-collab-preview--webkit-fix-css
-  "foreignObject.typst-svg-mixin-canvas { visibility: hidden; }"
-  "Hide the canvas placeholders partial rendering uses for far pages.
-
-With partial rendering on, a page outside the viewport is not drawn as SVG
-but as a `<foreignObject class=\"typst-svg-mixin-canvas\">' holding a
-`<canvas>', inside the page's transformed `<g>'.  WebKitGTK paints such a
-foreignObject ignoring the ancestor transform: at the SVG origin, at the
-canvas's own size.  Every far page therefore paints over the first one, and
-the last painted wins -- which is the document's last page, oversized, at
-the top.  They render lazily, so it shows up a few seconds in.  Chrome and
-Firefox apply the transform and never show it.
-
-The DOM is correct throughout; only the paint is wrong, so the fix is to
-keep those placeholders out of the paint.  A far page then has no
-low-resolution stand-in until it scrolls into view and is drawn as SVG,
-which is no loss anyone will notice.  Giving the canvas its own compositing
-layer, or `will-change' on the groups, was tried and does not help.")
-
 (defun noteworthy-collab-preview-inject-webkit-fix ()
-  "Put `noteworthy-collab-preview--webkit-fix-css' into the preview page.
-Idempotent: the rule lives in a `<style id=nw-webkit-fix>' in `<head>', so
-it survives the viewer replacing the document and is added once."
+  "Apply the WebKitGTK placeholder fix to the preview page.
+
+The fix itself lives in `noteworthy-webkit' (noteworthy.el), where it is
+installed on `xwidget-webkit-callback' for every preview -- plain
+Noteworthy and `typst-preview-mode' hit the same bug -- so this normally
+has nothing to do.  Kept as a belt for the braces: a page that loaded
+before that file did, or a session where it is not loaded at all."
   (interactive)
-  (dolist (pair (noteworthy-collab-preview--xwidget-windows))
-    (with-current-buffer (car pair)
-      (let ((xw (ignore-errors (xwidget-webkit-current-session))))
-        (when xw
-          (ignore-errors
-            (xwidget-webkit-execute-script
-             xw (format "(function(){if(document.getElementById('nw-webkit-fix'))return;var s=document.createElement('style');s.id='nw-webkit-fix';s.textContent=%S;document.head.appendChild(s);})();"
-                        noteworthy-collab-preview--webkit-fix-css))))))))
+  (if (fboundp 'noteworthy-webkit-inject-fix-everywhere)
+      (noteworthy-webkit-inject-fix-everywhere)
+    (dolist (pair (noteworthy-collab-preview--xwidget-windows))
+      (with-current-buffer (car pair)
+        (let ((xw (ignore-errors (xwidget-webkit-current-session))))
+          (when xw
+            (ignore-errors
+              (xwidget-webkit-execute-script
+               xw "(function(){if(!document.getElementById('typst-app')||document.getElementById('nw-webkit-fix'))return;var s=document.createElement('style');s.id='nw-webkit-fix';s.textContent='foreignObject.typst-svg-mixin-canvas{visibility:hidden}';document.head.appendChild(s);})();"))))))))
 
 (defun noteworthy-collab-preview-remeasure ()
   "Tell the preview page to measure its container again.
