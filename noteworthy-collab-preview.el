@@ -989,26 +989,107 @@ errors are visible without leaving Emacs."
         ((and (listp diag) (plist-member diag key)) (plist-get diag key))
         (t nil)))
 
+(defun noteworthy-collab-preview--list (x)
+  "X as a list, whether lsp-mode stored it as a list or a vector."
+  (if (vectorp x) (append x nil) x))
+
+(defun noteworthy-collab-preview--uri-path (uri near)
+  "The file URI names, on the same host as the file NEAR.
+Diagnostics from a tinymist on a TRAMP host carry the host's own paths."
+  (let ((local (url-unhex-string (replace-regexp-in-string "\\`file://" "" uri)))
+        (remote (file-remote-p near)))
+    (if (and remote (not (file-remote-p local))) (concat remote local) local)))
+
+(defun noteworthy-collab-preview--source-lines (path cache)
+  "The lines of PATH, from its buffer if one visits it, cached in CACHE."
+  (or (gethash path cache)
+      (puthash path
+               (split-string
+                (let ((buf (find-buffer-visiting path)))
+                  (if buf
+                      (with-current-buffer buf
+                        (save-restriction (widen)
+                          (buffer-substring-no-properties (point-min) (point-max))))
+                    (condition-case nil
+                        (with-temp-buffer (insert-file-contents path) (buffer-string))
+                      (error ""))))
+                "\n")
+               cache)))
+
+(defun noteworthy-collab-preview--pos (range key)
+  "(LINE . CHARACTER) of RANGE's KEY, `:start' or `:end', zero-based."
+  (let ((p (noteworthy-collab-preview--diag-field range key (substring (symbol-name key) 1))))
+    (cons (or (noteworthy-collab-preview--diag-field p :line "line") 0)
+          (or (noteworthy-collab-preview--diag-field p :character "character") 0))))
+
+(defun noteworthy-collab-preview--render (path diag cache)
+  "DIAG, a diagnostic for PATH, in Typst's own report format.
+The one `typst compile' prints and typst-preview's tinymist buffer shows:
+message, location, the source line with the span underlined, hints, and
+the call trace.  tinymist sends all of it -- hints appended to the
+message, the trace as related information -- so nothing is lost by
+going through the language server."
+  (let* ((root (or (bound-and-true-p noteworthy-collab--project-root)
+                   (bound-and-true-p noteworthy-collab-project-root)))
+         (rel (lambda (f) (if root (file-relative-name f root) (file-name-nondirectory f))))
+         (parts (split-string (or (noteworthy-collab-preview--diag-field diag :message "message") "")
+                              "\nHint: "))
+         (range (noteworthy-collab-preview--diag-field diag :range "range"))
+         (start (noteworthy-collab-preview--pos range :start))
+         (end (noteworthy-collab-preview--pos range :end))
+         (lines (noteworthy-collab-preview--source-lines path cache))
+         (text (or (nth (car start) lines) ""))
+         (num (number-to-string (1+ (car start))))
+         (pad (make-string (1+ (length num)) ?\s))
+         (sc (min (cdr start) (length text)))
+         (ec (if (= (car end) (car start)) (min (cdr end) (length text)) (length text)))
+         (out (nreverse
+               (list (format "error: %s" (car parts))
+                     (format "%s┌─ %s:%s:%d" pad (funcall rel path) num (cdr start))
+                     (format "%s│" pad)
+                     (format "%s │ %s" num text)
+                     (format "%s│ %s%s" pad (make-string sc ?\s)
+                             (make-string (max 1 (- ec sc)) ?^))))))
+    (dolist (hint (cdr parts))
+      (push (format "%s= hint: %s" pad hint) out))
+    (dolist (rel-info (noteworthy-collab-preview--list
+                       (noteworthy-collab-preview--diag-field diag :relatedInformation "relatedInformation")))
+      (let* ((loc (noteworthy-collab-preview--diag-field rel-info :location "location"))
+             (file (noteworthy-collab-preview--uri-path
+                    (noteworthy-collab-preview--diag-field loc :uri "uri") path))
+             (rrange (noteworthy-collab-preview--diag-field loc :range "range"))
+             (rs (noteworthy-collab-preview--pos rrange :start))
+             (re (noteworthy-collab-preview--pos rrange :end))
+             (rline (or (nth (car rs) (noteworthy-collab-preview--source-lines file cache)) ""))
+             (snippet (substring rline (min (cdr rs) (length rline))
+                                 (if (= (car re) (car rs)) (min (max (cdr re) (cdr rs)) (length rline))
+                                   (length rline)))))
+        (push "" out)
+        (push (format "  %s at %s:%d:%d"
+                      (noteworthy-collab-preview--diag-field rel-info :message "message")
+                      (funcall rel file) (1+ (car rs)) (cdr rs))
+              out)
+        (push (concat "    " snippet) out)))
+    (mapconcat #'identity (nreverse out) "\n")))
+
 (defun noteworthy-collab-preview--errors ()
-  "Every error tinymist currently reports, as \"file:line  message\" strings.
+  "Every error tinymist currently reports, each as a full Typst report.
 
 Errors only.  A warning does not stop the document rendering, so it does not
 explain a blank preview and only buries the thing that does."
-  (let (out)
+  (let (out (cache (make-hash-table :test #'equal)))
     (when (fboundp 'lsp-diagnostics)
       (ignore-errors
         (maphash
          (lambda (path diags)
-           (dolist (d (append diags nil))
+           (dolist (d (noteworthy-collab-preview--list diags))
              (when (eq 1 (noteworthy-collab-preview--diag-field d :severity "severity"))
-               (let* ((rng (noteworthy-collab-preview--diag-field d :range "range"))
-                      (st (noteworthy-collab-preview--diag-field rng :start "start"))
-                      (line (1+ (or (noteworthy-collab-preview--diag-field st :line "line") 0))))
-                 (push (format "%s:%d  %s"
-                               (file-name-nondirectory path) line
-                               (or (noteworthy-collab-preview--diag-field d :message "message")
-                                   ""))
-                       out)))))
+               (push (condition-case err
+                         (noteworthy-collab-preview--render path d cache)
+                       (error (format "error: %s\n  (in %s; could not render: %s)"
+                                      (noteworthy-collab-preview--diag-field d :message "message")
+                                      path (error-message-string err))))
+                     out))))
          (lsp-diagnostics))))
     (sort out #'string<)))
 
@@ -1036,7 +1117,7 @@ explain a blank preview and only buries the thing that does."
                    (errors
                     (insert (format "\n=== %d build error%s -- the preview cannot render ===\n"
                                     (length errors) (if (cdr errors) "s" "")))
-                    (dolist (e errors) (insert "  " e "\n")))
+                    (dolist (e errors) (insert "\n" e "\n")))
                    ;; Only worth saying when something was broken before.
                    ((and (listp was) was)
                     (insert "\n=== build errors cleared ===\n"))))
