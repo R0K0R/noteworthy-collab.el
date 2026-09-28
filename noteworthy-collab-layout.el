@@ -69,6 +69,8 @@ Call this after any operation that might cause Treemacs to switch roots."
 ;;; PDF Window Setup
 ;;; ============================================================
 
+(defvar noteworthy-pdf-buffer)
+
 (defun noteworthy-collab--setup-pdf-window (editor-window pdf-file)
   "Setup the PDF window next to EDITOR-WINDOW displaying PDF-FILE."
   (when (and pdf-file
@@ -93,6 +95,8 @@ Call this after any operation that might cause Treemacs to switch roots."
           (ignore-errors (window-resize pdf-window delta t)))
         (select-window pdf-window)
         (find-file pdf-file)
+        ;; What `noteworthy-pdf-scroll' (noteworthy.el) scrolls.
+        (setq noteworthy-pdf-buffer (current-buffer))
         ;; Only fit zoom to width, do not resize window
         (when (bound-and-true-p pdf-view-mode)
           (run-with-timer 0.1 nil
