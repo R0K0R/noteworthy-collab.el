@@ -20,6 +20,8 @@
 (defvar noteworthy-collab-project-root nil
   "TRAMP path to the current project root.")
 
+(declare-function noteworthy-typst-first-page "noteworthy-typst" (dir))
+
 (defvar noteworthy-collab-master-file nil
   "Path to the master file (parser.typ).")
 
@@ -201,7 +203,9 @@ Optional PDF-PATH-ARG specifies a PDF file to display."
       
       (setq-default noteworthy-collab-master-file master-path)
       (setq noteworthy-collab-master-file master-path)
-      (find-file master-path))
+      ;; The editor opens the first chapter page, which is what gets
+      ;; written; the master stays the preview's document regardless.
+      (find-file (or (noteworthy-typst-first-page dir) master-path)))
 
     (let ((editor-window (selected-window))
           ;; keep size tracking quiet until the layout is finished
