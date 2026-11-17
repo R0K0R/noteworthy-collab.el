@@ -1,3 +1,11 @@
+> **Retired (2026-11).** This package is replaced by
+> [emacs-collab.el](https://github.com/R0K0R/emacs-collab.el) (one protocol for
+> collaborative editing in Emacs) with
+> [syncworthy_bridge](https://github.com/R0K0R/syncworthy_bridge) and
+> [noteworthy-workspace](https://github.com/R0K0R/noteworthy-workspace).
+> Noteworthy's servers now run [Syncworthy](https://github.com/R0K0R/syncworthy),
+> which no longer speaks this package's `/ws/emacs` protocol.
+
 # noteworthy-collab.el
 
 Real-time collaborative editing for [Noteworthy](https://github.com/sihooleebd/noteworthy) Typst projects.
